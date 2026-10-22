@@ -63,8 +63,16 @@ if [[ -n $salida ]]; then dir=${salida:A}
 elif [[ $modo == tramo ]]; then dir=${video:h}/$base-tramo-$desde-$hasta
 else dir=${video:h}/$base-fotogramas; fi
 mkdir -p "$dir"
+# Repetir el mismo comando no ensucia la carpeta: lo que este script escribió antes (los t<ms>ms.png, o
+# la hoja.png en --hoja) es salida regenerable y se vacía al empezar. Otros ficheros no se tocan.
+if [[ $modo == hoja ]]; then previos=($dir/hoja.png(N)); else previos=($dir/t<->ms(|_<->).png(N)); fi
+if (( ${#previos} )); then
+  rm -f -- $previos
+  print -r -- "Aviso: vaciados ${#previos} fichero(s) de una ejecución anterior en $dir"
+fi
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/fotogramas.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
+: > "$tmp/escritos"
 
 dur=$(ffprobe -v error -select_streams v:0 -show_entries format=duration -of csv=p=0 "$video")
 [[ $dur == <->* ]] || fallo "ffprobe no lee la duración de $video"
@@ -83,7 +91,10 @@ renombrar() {
   local -a ts files; ts=("${(@f)$(<$1)}"); files=($tmp/f_*.png(N))
   (( ${#ts} == ${#files} )) || fallo "ffmpeg escribió ${#files} PNG y vio ${#ts} fotogramas"
   local k
-  for k in {1..${#files}}; do mv "$files[k]" "$dir/$(nombre $ts[k])"; done
+  local nom
+  for k in {1..${#files}}; do
+    nom=$(nombre $ts[k]); mv "$files[k]" "$dir/$nom"; print -r -- $nom >> "$tmp/escritos"
+  done
 }
 
 # Tiempos (pts_time) de los fotogramas que ha pasado ffmpeg, del log de showinfo.
@@ -106,7 +117,7 @@ tramo)
     "$tmp/f_%06d.png" 2> "$tmp/log" || { tail -5 "$tmp/log" >&2; fallo "ffmpeg falló"; }
   tiempos "$tmp/log" > "$tmp/ts"
   renombrar "$tmp/ts"
-  total=$(print -l $dir/t*ms.png | wc -l | tr -d ' ')
+  total=$(wc -l < "$tmp/escritos" | tr -d ' ')
   print -r -- "Carpeta: $dir"
   print -r -- "PNG: $total (entre $desde s y $hasta s)"
   sort -g "$tmp/ts" | awk 'NR>1 {d=($1-p)*1000; s+=d; if (d>m) m=d; k++} {p=$1}
@@ -131,7 +142,7 @@ muestreo|hoja)
   dir=$real
   if [[ $modo == muestreo ]]; then
     print -r -- "Carpeta: $dir"
-    print -r -- "PNG: $(print -l $dir/t*ms.png | wc -l | tr -d ' ') (repartidos por ${dur%%.*} s de vídeo)"
+    print -r -- "PNG: $(wc -l < "$tmp/escritos" | tr -d ' ') (repartidos por ${dur%%.*} s de vídeo)"
   else
     cols=$(awk -v n=$n 'BEGIN {c=int(sqrt(n)+0.999); print c}')
     hoja=$dir/hoja.png
@@ -143,8 +154,8 @@ muestreo|hoja)
       miniatura=$(( ancho / cols ))
       # Etiqueta «t=SS.mmm s» a partir del nombre en ms.
       labels=()
-      for p in $tmp/m/t*ms.png; do
-        ms=${${p:t}[2,7]}; ms=$(( 10#$ms ))
+      for p in $tmp/m/t*ms.png(n); do
+        [[ ${p:t} =~ '^t([0-9]+)ms' ]]; ms=$(( 10#$match[1] ))
         labels+=(-label "$(printf '%d.%03d s' $(( ms / 1000 )) $(( ms % 1000 )))" "$p")
       done
       magick montage -font "$font" -pointsize $(( miniatura / 14 + 8 )) -fill white -background '#222' \
@@ -152,10 +163,12 @@ muestreo|hoja)
       print -r -- "Tiempos sobre las miniaturas: sí (ImageMagick)"
     else
       miniatura=$(( ancho / cols ))
-      ffmpeg -hide_banner -nostats -loglevel error -y -pattern_type glob -framerate 1 -i "$tmp/m/t*ms.png" \
+      # Enlaces s_001.png… en orden numérico del tiempo (el glob de ffmpeg ordenaría «t1501…» antes que «t501…»).
+      k=0; for p in $tmp/m/t*ms.png(n); do (( ++k )); ln -s "$p" "$tmp/s_${(l:3::0:)k}.png"; done
+      ffmpeg -hide_banner -nostats -loglevel error -y -framerate 1 -i "$tmp/s_%03d.png" \
         -vf "scale=${miniatura}:-2,tile=${cols}x$(( (n + cols - 1) / cols )):padding=4" -frames:v 1 "$hoja"
       print -r -- "Tiempos sobre las miniaturas: no (sin ImageMagick ni tipografía); ver la lista:"
-      for p in $tmp/m/t*ms.png; do print -r -- "  ${p:t}"; done
+      for p in $tmp/m/t*ms.png(n); do print -r -- "  ${p:t}"; done
     fi
     print -r -- "Carpeta: $dir"
     print -r -- "Hoja: $hoja ($n miniaturas, $cols columnas, ancho ${ancho}px)"
