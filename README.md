@@ -54,3 +54,7 @@ Para forzar una pantalla: `GRABAR_PANTALLA_INDICE=1 grabar-pantalla 10`. El núm
 - `app/instalar.sh`: compila, monta el bundle, genera el icono y firma.
 
 Editar el script no exige reinstalar: la app guarda su ruta. Tocar `app/` sí.
+
+## Licencia
+
+MIT. Ver [LICENSE](LICENSE).
