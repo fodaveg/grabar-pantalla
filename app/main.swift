@@ -1,83 +1,372 @@
-// Icono de barra de menús para `grabar-pantalla`. No graba nada: lanza el script del repo
-// (ruta en la clave GrabarPantallaScript del Info.plist) como hijo con GRABAR_PANTALLA_APP=1,
-// lee su stdout y pinta el estado a partir de las líneas `@estado ...`. El resto de líneas
-// (y todo su stderr) se reenvían tal cual a la salida de esta app.
+// Grabar pantalla: app de barra de menús que graba una pantalla del Mac. La captura es
+// ScreenCaptureKit (`SCStream` de la pantalla elegida, sin la propia app) y la escritura,
+// `AVAssetWriter` (mp4, H.264 por hardware), todo en este proceso: no hay ffmpeg ni script hijo.
+// Deja el vídeo en ~/Movies/pantalla-AAAAMMDD-HHMMSS.mp4.
 //
 // Dos modos, según los argumentos:
 // - Residente (sin argumentos: LaunchServices desde Spotlight, Finder, `open` o el inicio de
-//   sesión): se queda en la barra de menús en espera y lanza un `Process` nuevo por grabación,
-//   con «0» = hasta Detener (el script pone un tope de 30 min). Abierta normalmente graba al
-//   instante; como ítem de inicio de sesión queda en espera. Registra el atajo global.
-// - Terminal (con argumentos, que pone el script `grabar-pantalla [segundos]`): proceso propio de
-//   un solo uso. Graba, espera al final y sale con el código del script. No toca la residente.
+//   sesión): se queda en la barra de menús en espera y graba una vez por petición, hasta Detener
+//   (tope de 30 min). Abierta normalmente graba al instante; como ítem de inicio de sesión queda
+//   en espera. Registra el atajo global.
+// - Terminal (con argumentos, que pone el script `grabar-pantalla [segundos]` al hacer exec):
+//   proceso propio de un solo uso. Graba, imprime el resultado y sale con 0 si hay vídeo válido.
+//   No toca la residente.
 import AppKit
+import AVFoundation
 import Carbon.HIToolbox
+import ScreenCaptureKit
 import UserNotifications
+import VideoToolbox
 
 // MARK: - Arranque
 
+/// Ruta del script `grabar-pantalla` del repo (la pone instalar.sh). Solo sirve para encontrar
+/// `fotogramas`, que vive a su lado.
 let script = Bundle.main.object(forInfoDictionaryKey: "GrabarPantallaScript") as? String ?? ""
-// LaunchServices puede añadir -psn_... o -NS...; no son del script.
+// LaunchServices puede añadir -psn_... o -NS...; no son de la terminal.
 let argsTerminal = Array(CommandLine.arguments.dropFirst()).filter { !$0.hasPrefix("-psn_") && !$0.hasPrefix("-NS") && !$0.hasPrefix("-Apple") }
 let residente = argsTerminal.isEmpty
-let args = residente ? ["0"] : argsTerminal
 
-// Foundation lanza el script en su propio grupo de procesos (medido), así que un Ctrl-C en la
-// terminal llega solo a esta app. Se reenvía al script, que lo pasa a ffmpeg y cierra el mp4
-// limpio; la app sobrevive hasta que el script termine. Un manejador (no SIG_IGN) para que el
-// hijo no herede la señal ignorada y pueda atraparla.
-var pidScript: pid_t = 0
-var interrumpido = false
-signal(SIGINT) { _ in
-    interrumpido = true
-    if pidScript > 0 { kill(pidScript, SIGINT) }
+/// Calidad de la captura y del vídeo. Hoy fija; los Ajustes la cambiarán aquí.
+struct Calidad {
+    /// Fotogramas por segundo pedidos (`minimumFrameInterval` = 1/fps). ScreenCaptureKit solo
+    /// entrega cuando cambia algo y como mucho al refresco de la pantalla: el vídeo sale con fps
+    /// variable, con las marcas de tiempo de la captura.
+    var fps: Int32 = 120
+    /// Bitrate medio de H.264 en bits/s (40 Mb/s, lo mismo que se usaba con ffmpeg).
+    var bitrate = 40_000_000
 }
+let calidad = Calidad()
+/// Tope de seguridad de «hasta Detener» (residente, o `grabar-pantalla 0`).
+let topeSegundos: Double = 30 * 60
+let mensajePermiso = "La captura no arranca. Revisa Ajustes del Sistema > Privacidad y seguridad > Grabación de pantalla y audio del sistema: «Grabar pantalla» debe estar activado"
 
-/// avfoundation numera «Capture screen N» en el orden de CGGetActiveDisplayList (medido con
-/// dos pantallas: 0 = la principal, 3024x1964; 1 = la externa, 1920x1080). Devuelve las
-/// pantallas de AppKit en ese orden.
-func pantallasEnOrdenAvfoundation() -> [NSScreen] {
+/// Salida para la terminal (en la residente va a donde la deje LaunchServices). Sin búfer, para
+/// que «GRABANDO» salga en su momento.
+func decir(_ t: String) { FileHandle.standardOutput.write(Data((t + "\n").utf8)) }
+func avisar(_ t: String) { FileHandle.standardError.write(Data((t + "\n").utf8)) }
+
+/// Las pantallas en el orden de CGGetActiveDisplayList (0 = la principal de Ajustes > Pantallas).
+/// Es el mismo orden que numeraba ffmpeg con «Capture screen N», así que GRABAR_PANTALLA_INDICE
+/// conserva su significado.
+func pantallasEnOrden() -> [(id: CGDirectDisplayID, pantalla: NSScreen)] {
     var ids = [CGDirectDisplayID](repeating: 0, count: 16)
     var n: UInt32 = 0
     CGGetActiveDisplayList(16, &ids, &n)
     return ids.prefix(Int(n)).compactMap { id in
-        NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id }
+        NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id }.map { (id, $0) }
     }
 }
 
-/// Índice de avfoundation y pantalla que se graba: la pedida explícitamente (submenú), la que
-/// fije GRABAR_PANTALLA_INDICE (a mano desde la terminal) o, si no, la que contiene el puntero.
-func elegirPantalla(forzada: Int? = nil) -> (indice: Int, nombre: String) {
-    let lista = pantallasEnOrdenAvfoundation()
+/// Pantalla que se graba: la pedida explícitamente (submenú), la que fije GRABAR_PANTALLA_INDICE
+/// (a mano desde la terminal) o, si no, la que contiene el puntero. `id` es 0 si el índice pedido
+/// no existe; la captura lo convierte en error.
+func elegirPantalla(forzada: Int? = nil) -> (indice: Int, nombre: String, id: CGDirectDisplayID) {
+    let lista = pantallasEnOrden()
     var pedida = forzada
     if pedida == nil, !residente, let v = ProcessInfo.processInfo.environment["GRABAR_PANTALLA_INDICE"] { pedida = Int(v) }
-    if let i = pedida { return (i, i < lista.count ? lista[i].localizedName : "pantalla \(i)") }
+    if let i = pedida { return i >= 0 && i < lista.count ? (i, lista[i].pantalla.localizedName, lista[i].id) : (i, "pantalla \(i)", 0) }
     let p = NSEvent.mouseLocation
-    if let i = lista.firstIndex(where: { NSMouseInRect(p, $0.frame, false) }) { return (i, lista[i].localizedName) }
-    return (0, lista.first?.localizedName ?? "pantalla 0")
+    if let i = lista.firstIndex(where: { NSMouseInRect(p, $0.pantalla.frame, false) }) { return (i, lista[i].pantalla.localizedName, lista[i].id) }
+    return (0, lista.first?.pantalla.localizedName ?? "pantalla 0", lista.first?.id ?? CGMainDisplayID())
 }
 
-// SIGTERM y SIGHUP (cierre ordenado desde fuera): el manejador C solo escribe en una tubería y
-// el hilo principal hace la limpieza. Con un manejador (no SIG_IGN) el script hijo no hereda
-// la señal ignorada.
+// SIGINT (Ctrl-C), SIGTERM y SIGHUP: el manejador C solo escribe el número de señal en una
+// tubería y el hilo principal decide. Ctrl-C detiene la grabación (y cierra el mp4); SIGTERM y
+// SIGHUP la cierran y salen.
 var tuberiaSenal: [Int32] = [-1, -1]
 pipe(&tuberiaSenal)
-func alSenal(_ s: Int32) { var b: UInt8 = 1; write(tuberiaSenal[1], &b, 1) }
+func alSenal(_ s: Int32) { var b = UInt8(truncatingIfNeeded: s); write(tuberiaSenal[1], &b, 1) }
+signal(SIGINT, alSenal)
 signal(SIGTERM, alSenal)
 signal(SIGHUP, alSenal)
 
+// MARK: - Captura
+
+/// Una captura: `SCStream` de una pantalla → `AVAssetWriter`. Todo lo que toca el escritor corre en
+/// `cola`, la misma en la que ScreenCaptureKit entrega los fotogramas: añadir uno y cerrar el fichero
+/// no se pisan. Los avisos al controlador (`alEmpezar`, `alAcabar`) llegan por el hilo principal.
+/// Cada fotograma se escribe al llegar el siguiente, con su duración real: así el último dura hasta
+/// el corte aunque la pantalla llevara un rato quieta (sin esto el mp4 acaba en el último cambio).
+final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
+    enum Final { case video(fotogramas: Int, segundos: Double), fallo(String), cancelado }
+
+    let ruta: URL
+    let limite: Double
+    /// Primer fotograma escrito: la grabación ya corre.
+    var alEmpezar: () -> Void = {}
+    /// Se llama una sola vez, con el mp4 ya cerrado (o borrado si no vale).
+    var alAcabar: (Final) -> Void = { _ in }
+
+    private let cola = DispatchQueue(label: "net.fodaveg.grabar-pantalla.captura", qos: .userInteractive)
+    private var stream: SCStream?
+    private var escritor: AVAssetWriter?
+    private var entrada: AVAssetWriterInput?
+    private var primero: CMTime?
+    /// Fotograma completo que espera al siguiente (o al corte) para saber cuánto dura.
+    private var retenido: CMSampleBuffer?
+    /// Fin del último fotograma escrito (su PTS más su duración).
+    private var finEscrito = CMTime.invalid
+    private var fotogramas = 0
+    /// Detener, cancelar o fallo: ya no entra ningún fotograma más.
+    private var cerrado = false
+
+    init(ruta: URL, limite: Double) {
+        self.ruta = ruta
+        self.limite = limite
+    }
+
+    /// Pide el contenido compartible, monta filtro, stream y escritor, y arranca. Sin permiso de
+    /// Grabación de pantalla falla al momento (sin esperar a que llegue imagen).
+    func arrancar(pantalla id: CGDirectDisplayID) {
+        // Sin permiso, ScreenCaptureKit falla igual, pero esto no espera al servidor de ventanas.
+        // La petición enseña el diálogo del sistema la primera vez y registra la app en la lista
+        // de Ajustes; las siguientes no hace nada.
+        guard CGPreflightScreenCaptureAccess() else {
+            CGRequestScreenCaptureAccess()
+            cola.async { [self] in fallar(mensajePermiso) }
+            return
+        }
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { [self] contenido, error in
+            cola.async { [self] in
+                guard !cerrado else { return }
+                guard let contenido else { fallar(describir(error)); return }
+                guard let pantalla = contenido.displays.first(where: { $0.displayID == id }) else {
+                    fallar("No encuentro esa pantalla (¿se ha desconectado?)")
+                    return
+                }
+                // La propia app fuera del vídeo: su icono de la barra de menús, el menú abierto y
+                // cualquier ventana suya. Por identificador y no por pid: la residente y la de la
+                // terminal conviven y ninguna de las dos debe salir.
+                let yo = Bundle.main.bundleIdentifier
+                let propia = contenido.applications.filter { $0.processID == getpid() || (yo != nil && $0.bundleIdentifier == yo) }
+                let filtro = SCContentFilter(display: pantalla, excludingApplications: propia, exceptingWindows: [])
+                montar(filtro: filtro, id: id, puntos: (pantalla.width, pantalla.height))
+            }
+        }
+    }
+
+    private func montar(filtro: SCContentFilter, id: CGDirectDisplayID, puntos: (Int, Int)) {
+        // Resolución nativa en píxeles: la del modo actual (3024x1964 en la integrada; en puntos
+        // sería la mitad). H.264 4:2:0 pide medidas pares.
+        let modo = CGDisplayCopyDisplayMode(id)
+        let ancho = (modo?.pixelWidth ?? puntos.0) & ~1, alto = (modo?.pixelHeight ?? puntos.1) & ~1
+        let cfg = SCStreamConfiguration()
+        cfg.width = ancho
+        cfg.height = alto
+        cfg.minimumFrameInterval = CMTime(value: 1, timescale: calidad.fps)
+        // 8 es el máximo recomendado: el codificador retiene los búferes mientras trabaja y con
+        // menos la captura se atasca a 120 fps.
+        cfg.queueDepth = 8
+        cfg.showsCursor = true
+        // Los clics marcados solo los pinta ScreenCaptureKit en BGRA (cabecera de SCStream); en
+        // macOS 13-14 no hay marcado y se captura en 4:2:0, que es lo que come VideoToolbox.
+        if #available(macOS 15.0, *) {
+            cfg.pixelFormat = kCVPixelFormatType_32BGRA
+            cfg.showMouseClicks = true
+        } else {
+            cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        }
+        cfg.colorSpaceName = CGColorSpace.sRGB
+        cfg.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2
+        // Audio (para los Ajustes): cfg.capturesAudio = true, una segunda salida
+        // `addStreamOutput(self, type: .audio, …)` en esta misma cola y una entrada AAC en el escritor.
+        do {
+            // AVAssetWriter no sobrescribe: si existe (dos grabaciones en el mismo segundo), fuera.
+            try? FileManager.default.removeItem(at: ruta)
+            let escritor = try AVAssetWriter(outputURL: ruta, fileType: .mp4)
+            let entrada = AVAssetWriterInput(mediaType: .video, outputSettings: [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: ancho,
+                AVVideoHeightKey: alto,
+                AVVideoEncoderSpecificationKey: [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: true],
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: calidad.bitrate,
+                    AVVideoExpectedSourceFrameRateKey: calidad.fps,
+                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                    // Sin fotogramas B: con fps variable las marcas de tiempo salen tal cual.
+                    AVVideoAllowFrameReorderingKey: false,
+                    // Un fotograma clave por segundo, para que `fotogramas` y los reproductores salten rápido.
+                    AVVideoMaxKeyFrameIntervalDurationKey: 1,
+                ],
+                AVVideoColorPropertiesKey: [
+                    AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                    AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                    AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+                ],
+            ])
+            entrada.expectsMediaDataInRealTime = true
+            // Escala fina (1/90000 s) para no redondear las marcas de tiempo de la captura.
+            entrada.mediaTimeScale = 90_000
+            guard escritor.canAdd(entrada) else { fallar("El escritor de vídeo no acepta H.264 a \(ancho)x\(alto)"); return }
+            escritor.add(entrada)
+            guard escritor.startWriting() else { fallar("No puedo escribir \(ruta.path): \(describir(escritor.error))"); return }
+            let stream = SCStream(filter: filtro, configuration: cfg, delegate: self)
+            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: cola)
+            self.escritor = escritor
+            self.entrada = entrada
+            self.stream = stream
+            stream.startCapture { [self] error in
+                cola.async { [self] in
+                    if let error { fallar(describir(error)); return }
+                    // La primera imagen llega en unas décimas. Si no llega, error en vez de un
+                    // «Iniciando…» eterno.
+                    cola.asyncAfter(deadline: .now() + 5) { [self] in
+                        if primero == nil { fallar("La captura arrancó pero no llega imagen de la pantalla") }
+                    }
+                }
+            }
+        } catch {
+            fallar(describir(error))
+        }
+    }
+
+    /// Detener a mano (clic, atajo, reapertura, Ctrl-C, Salir, SIGTERM): el vídeo dura hasta ahora,
+    /// aunque la pantalla llevara un rato quieta y no hubiera fotogramas nuevos.
+    func detener() {
+        cola.async { [self] in
+            guard let primero else { cancelarYa(); return }
+            finalizar(hasta: CMTimeMinimum(CMClockGetTime(CMClockGetHostTimeClock()), primero + CMTime(seconds: limite, preferredTimescale: 1_000_000_000)))
+        }
+    }
+
+    /// Cancelar antes de que haya vídeo (cuenta atrás ya pasada, «Iniciando…»): sin fichero.
+    func cancelar() { cola.async { [self] in cancelarYa() } }
+
+    private func cancelarYa() {
+        guard !cerrado else { return }
+        cerrado = true
+        retenido = nil
+        stream?.stopCapture { _ in }
+        escritor?.cancelWriting()
+        try? FileManager.default.removeItem(at: ruta)
+        acabar(.cancelado)
+    }
+
+    /// Error sin vídeo aprovechable: se borra lo que haya.
+    private func fallar(_ mensaje: String) {
+        guard !cerrado else { return }
+        cerrado = true
+        retenido = nil
+        stream?.stopCapture { _ in }
+        escritor?.cancelWriting()
+        try? FileManager.default.removeItem(at: ruta)
+        acabar(.fallo(mensaje))
+    }
+
+    /// Escribe el fotograma retenido `m` con duración hasta `fin` (el PTS del siguiente o el corte).
+    /// Si el codificador no da abasto, se pierde (como se perdía en ffmpeg) y no cuenta.
+    private func escribir(_ m: CMSampleBuffer, hasta fin: CMTime) {
+        guard let entrada else { return }
+        let pts = m.presentationTimeStamp
+        // Nunca menos de un intervalo de captura: un fotograma de duración 0 no se vería.
+        let duracion = CMTimeMaximum(fin - pts, CMTime(value: 1, timescale: calidad.fps))
+        var t = CMSampleTimingInfo(duration: duracion, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
+        var copia: CMSampleBuffer?
+        guard CMSampleBufferCreateCopyWithNewTiming(allocator: nil, sampleBuffer: m, sampleTimingEntryCount: 1,
+                                                    sampleTimingArray: &t, sampleBufferOut: &copia) == noErr,
+              let copia, entrada.isReadyForMoreMediaData else { return }
+        if entrada.append(copia) {
+            fotogramas += 1
+            finEscrito = pts + duracion
+        }
+    }
+
+    /// Escribe el último fotograma hasta `fin` y cierra el mp4 con `finishWriting` (escribe el
+    /// índice; sin él el fichero no se lee).
+    private func finalizar(hasta fin: CMTime) {
+        guard !cerrado, let escritor, let entrada, let primero else { return }
+        cerrado = true
+        stream?.stopCapture { _ in }
+        if let r = retenido {
+            retenido = nil
+            // El último no se tira por un codificador ocupado: se le da medio segundo.
+            let espera = Date().addingTimeInterval(0.5)
+            while !entrada.isReadyForMoreMediaData, escritor.status == .writing, Date() < espera { usleep(5_000) }
+            escribir(r, hasta: fin)
+        }
+        guard escritor.status == .writing, fotogramas > 0 else {
+            let motivo = fotogramas == 0 ? "No se escribió ningún fotograma" : "Falló la escritura del vídeo: \(describir(escritor.error))"
+            escritor.cancelWriting()
+            try? FileManager.default.removeItem(at: ruta)
+            acabar(.fallo(motivo))
+            return
+        }
+        let n = fotogramas, fin = finEscrito
+        entrada.markAsFinished()
+        escritor.endSession(atSourceTime: fin)
+        escritor.finishWriting { [self] in
+            if escritor.status == .completed {
+                acabar(.video(fotogramas: n, segundos: (fin - primero).seconds))
+            } else {
+                try? FileManager.default.removeItem(at: ruta)
+                acabar(.fallo("No se pudo cerrar el vídeo: \(describir(escritor.error))"))
+            }
+        }
+    }
+
+    private func acabar(_ f: Final) { DispatchQueue.main.async { [self] in alAcabar(f) } }
+
+    private func describir(_ e: Error?) -> String {
+        guard let e else { return "error desconocido" }
+        if (e as NSError).domain == SCStreamErrorDomain, (e as NSError).code == SCStreamError.Code.userDeclined.rawValue { return mensajePermiso }
+        return e.localizedDescription
+    }
+
+    // MARK: SCStreamOutput, SCStreamDelegate
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer muestra: CMSampleBuffer, of tipo: SCStreamOutputType) {
+        // Aquí entrará `.audio` cuando los Ajustes lo activen (a su propia entrada del escritor).
+        guard tipo == .screen, !cerrado, let escritor, muestra.isValid else { return }
+        // Solo fotogramas completos: los `.idle` (pantalla quieta) y similares no traen imagen nueva.
+        guard let info = CMSampleBufferGetSampleAttachmentsArray(muestra, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let bruto = info.first?[.status] as? Int, SCFrameStatus(rawValue: bruto) == .complete else { return }
+        let pts = muestra.presentationTimeStamp
+        if let primero {
+            // N segundos pedidos o tope: corta en el instante exacto, aunque el temporizador llegue tarde.
+            let corte = primero + CMTime(seconds: limite, preferredTimescale: 1_000_000_000)
+            if pts >= corte { finalizar(hasta: corte); return }
+        } else {
+            // La sesión empieza en el primer fotograma completo: el vídeo arranca en t = 0 con imagen.
+            escritor.startSession(atSourceTime: pts)
+            primero = pts
+            // Con la pantalla quieta no llegan fotogramas que disparen el corte de arriba.
+            cola.asyncAfter(deadline: .now() + limite) { [self] in
+                finalizar(hasta: pts + CMTime(seconds: limite, preferredTimescale: 1_000_000_000))
+            }
+            DispatchQueue.main.async { [self] in alEmpezar() }
+        }
+        if let r = retenido {
+            escribir(r, hasta: pts)
+            if escritor.status == .failed { fallar("Falló la escritura del vídeo: \(describir(escritor.error))"); return }
+        }
+        retenido = muestra
+    }
+
+    /// La captura se corta sola (pantalla desconectada, permiso retirado…): se guarda lo grabado.
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        cola.async { [self] in
+            if primero != nil { finalizar(hasta: CMClockGetTime(CMClockGetHostTimeClock())) } else { fallar(describir(error)) }
+        }
+    }
+}
+
+// MARK: - App
+
 enum Estado { case espera, cuenta(Int), iniciando, grabando, guardando, hecho, error }
 
-/// Una grabación: su `Process` y lo que el script cuenta de ella. Cada grabación estrena la suya,
-/// y lo que llega de una anterior (salida rezagada) se ignora comparando identidades.
+/// Una grabación: su cuenta atrás, su `Grabador` y lo que acabó dejando. Cada grabación estrena la
+/// suya, y lo que llega de una anterior (aviso rezagado) se ignora comparando identidades.
 final class Sesion {
-    let proceso = Process()
-    var pidFfmpeg: pid_t = 0
+    var cuenta: Timer?
+    var grabador: Grabador?
     var rutaVideo: String?
     var medida = ""
     var ultimaLinea = ""
+    var codigo: Int32 = 0
     var cancelado = false
-    var buffers: [Int32: Data] = [:]
+    /// Cierre de la app (Salir, SIGTERM) a la espera de que el mp4 quede cerrado.
+    var alCerrar: (() -> Void)?
 }
 
 /// Atajo global fijo: ⌃⌥⌘R (los ⌘⇧3/4/5 son del sistema).
@@ -91,13 +380,18 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var sesion: Sesion?
     var inicio = Date()
     var temporizador: Timer?
-    var pantalla = (indice: 0, nombre: "")
+    var pantalla = (indice: 0, nombre: "", id: CGDirectDisplayID(0))
     var fuenteSenal: DispatchSourceRead?
     var saliendo = false
     var menuActual = NSMenu()
     var tokenEspera = 0
     var lanzadaPorNotificacion = false
     var atajoRef: EventHotKeyRef?
+    /// Última grabación buena, para «Sacar fotogramas» desde la espera.
+    var ultimoVideo: String?
+    var sacandoFotogramas = false
+    /// Modo terminal: salida aplazada hasta que acabe `fotogramas`.
+    var salidaPendiente: Int32?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -109,9 +403,10 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         fuente.setEventHandler { [self] in
             var b: UInt8 = 0
             read(tuberiaSenal[0], &b, 1)
+            if Int32(b) == SIGINT { interrumpir(); return }
             guard !saliendo else { return }
             saliendo = true
-            matarHijos { exit(143) }
+            cerrarCaptura { exit(143) }
         }
         fuente.resume()
         fuenteSenal = fuente
@@ -151,39 +446,57 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         return false
     }
 
-    /// ⌘Q o terminate: nunca deja el script ni ffmpeg huérfanos.
+    /// ⌘Q o terminate: si graba, cierra el mp4 antes de salir.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard hayHijos() else { return .terminateNow }
-        matarHijos { NSApp.reply(toApplicationShouldTerminate: true) }
+        guard hayCaptura() else { return .terminateNow }
+        cerrarCaptura { NSApp.reply(toApplicationShouldTerminate: true) }
         return .terminateLater
     }
 
-    func vivo(_ p: pid_t) -> Bool { p > 0 && kill(p, 0) == 0 }
-    func hayHijos() -> Bool {
-        guard let s = sesion else { return false }
-        return (s.proceso.isRunning && s.proceso.processIdentifier > 0) || vivo(s.pidFfmpeg)
+    func hayCaptura() -> Bool {
+        guard sesion != nil else { return false }
+        switch estado {
+        case .cuenta, .iniciando, .grabando, .guardando: return true
+        default: return false
+        }
     }
 
-    /// SIGINT al script, que la pasa a ffmpeg (ffmpeg cierra el mp4 limpio); espera hasta 5 s a que acaben
-    /// y, si siguen vivos (una captura colgada no responde a SIGINT, medido), SIGKILL. No bloquea
-    /// el hilo principal: Foundation necesita su bucle para dar el script por terminado.
-    func matarHijos(luego: @escaping () -> Void) {
-        guard hayHijos(), let s = sesion else { luego(); return }
-        // Una sola SIGINT a ffmpeg: con dos seguidas aborta sin escribir el moov (mp4 roto, medido).
-        // Si el script vive la reenvía él; si no, va directa.
-        if s.proceso.isRunning { kill(s.proceso.processIdentifier, SIGINT) }
-        else if vivo(s.pidFfmpeg) { kill(s.pidFfmpeg, SIGINT) }
-        let limite = Date().addingTimeInterval(5)
-        // En modos comunes: con `terminateLater` AppKit corre el bucle en modo modal y un temporizador
-        // del modo por defecto no dispara nunca (medido: osascript quit se quedaba colgado).
-        let t = Timer(timeInterval: 0.05, repeats: true) { [self] t in
-            if hayHijos(), Date() < limite { return }
-            t.invalidate()
-            if vivo(s.pidFfmpeg) { kill(s.pidFfmpeg, SIGKILL) }
-            if s.proceso.isRunning { kill(s.proceso.processIdentifier, SIGKILL) }
-            luego()
+    /// Para salir: detiene la grabación en curso y llama a `luego` con el mp4 ya cerrado (o sin
+    /// nada que cerrar). Si el escritor no acaba en 10 s, sale igual y ese vídeo se pierde. No
+    /// bloquea el hilo principal: los avisos del grabador llegan por él.
+    func cerrarCaptura(luego: @escaping () -> Void) {
+        guard hayCaptura(), let s = sesion else { luego(); return }
+        var hecho = false
+        let una = { if !hecho { hecho = true; luego() } }
+        s.alCerrar = una
+        s.cuenta?.invalidate()
+        switch estado {
+        case .grabando:
+            estado = .guardando
+            pintar()
+            s.grabador?.detener()
+        case .iniciando:
+            s.cancelado = true
+            if let g = s.grabador { g.cancelar() } else { una() }
+        case .cuenta:
+            una()
+        default: break
         }
+        // En modos comunes: con `terminateLater` AppKit corre el bucle en modo modal y un temporizador
+        // del modo por defecto no dispara nunca (medido con la versión de ffmpeg: osascript quit se colgaba).
+        let t = Timer(timeInterval: 10, repeats: false) { _ in una() }
         RunLoop.main.add(t, forMode: .common)
+    }
+
+    /// Ctrl-C en la terminal (o SIGINT a la residente): detiene si graba, cancela en la cuenta
+    /// atrás y, en la terminal, sale sin esperar si ya está en ✓ o ⚠.
+    func interrumpir() {
+        switch estado {
+        case .grabando: detener()
+        case .cuenta, .iniciando: cancelar()
+        case .hecho, .error: if !residente { salirDeTerminal(con: sesion?.codigo ?? 0) }
+        case .espera, .guardando: break
+        }
     }
 
     // MARK: Atajo global
@@ -198,7 +511,7 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }, 1, &tipo, nil, nil)
         let r = RegisterEventHotKey(atajoTecla, atajoModificadores, EventHotKeyID(signature: OSType(0x4752_4142), id: 1),
                                     GetApplicationEventTarget(), 0, &atajoRef)
-        if r != noErr { FileHandle.standardError.write(Data("No pude registrar el atajo ⌃⌥⌘R (error \(r))\n".utf8)) }
+        if r != noErr { avisar("No pude registrar el atajo ⌃⌥⌘R (error \(r))") }
     }
 
     /// Atajo y reapertura: empieza si está en espera, detiene si graba, cancela en la cuenta atrás.
@@ -255,99 +568,82 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         completionHandler()
     }
 
-    // MARK: Proceso hijo
+    // MARK: Grabación
 
     /// Nueva grabación desde la espera (menú, atajo, reapertura o arranque normal).
     func empezar(indice: Int? = nil) {
         tokenEspera += 1
-        interrumpido = false
         pantalla = elegirPantalla(forzada: indice)
         estado = .cuenta(3)
         pintar()
         lanzar()
     }
 
+    /// Segundos de la grabación: los de la terminal (0 = hasta Detener) o, en la residente, hasta Detener.
+    func segundosPedidos() -> Double? {
+        guard let a = argsTerminal.first else { return 0 }
+        guard let n = Double(a.replacingOccurrences(of: ",", with: ".")), n >= 0, n.isFinite else { return nil }
+        return n
+    }
+
+    /// Cuenta atrás de 3 s y, al acabar, la captura.
     func lanzar() {
         let s = Sesion()
         sesion = s
-        guard !script.isEmpty, FileManager.default.isExecutableFile(atPath: script) else {
-            s.ultimaLinea = "No encuentro el script: \(script.isEmpty ? "(sin ruta en el Info.plist)" : script)"
-            terminar(s, codigo: 127)
+        guard let segundos = segundosPedidos() else {
+            s.ultimaLinea = "Uso: grabar-pantalla [segundos]   (0 = hasta Detener)"
+            terminar(s, .fallo(s.ultimaLinea), codigo: 2)
             return
         }
-        let proceso = s.proceso
-        proceso.executableURL = URL(fileURLWithPath: script)
-        proceso.arguments = args
-        var env = ProcessInfo.processInfo.environment
-        env["GRABAR_PANTALLA_APP"] = "1"
-        env["GRABAR_PANTALLA_INDICE"] = String(pantalla.indice)
-        proceso.environment = env
-        let salida = Pipe(), errores = Pipe()
-        proceso.standardOutput = salida
-        proceso.standardError = errores
-        let grupo = DispatchGroup()
-        for (pipe, esStdout) in [(salida, true), (errores, false)] {
-            grupo.enter()
-            pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
-                let datos = h.availableData
-                if datos.isEmpty {
-                    h.readabilityHandler = nil
-                    grupo.leave()
-                    return
-                }
-                DispatchQueue.main.async { self?.recibir(s, datos, stdout: esStdout) }
+        decir(segundos == 0 ? "Grabando hasta Detener (máx. 30 min) en 3 s…" : "Grabando \(formato(segundos, decimales: segundos.rounded() == segundos ? 0 : 1)) s en 3 s…")
+        var n = 3
+        // En modos comunes: con el menú abierto el bucle corre en modo de seguimiento y la cuenta seguiría parada.
+        let t = Timer(timeInterval: 1, repeats: true) { [weak self] t in
+            guard let self, s === self.sesion else { t.invalidate(); return }
+            n -= 1
+            if n > 0 {
+                self.estado = .cuenta(n)
+                self.pintar()
+            } else {
+                t.invalidate()
+                self.capturar(s, segundos: segundos == 0 ? topeSegundos : segundos)
             }
         }
-        grupo.enter()
-        proceso.terminationHandler = { _ in grupo.leave() }
-        grupo.notify(queue: .main) { [weak self] in
-            guard let self else { return }
-            pidScript = 0
-            self.terminar(s, codigo: s.proceso.terminationStatus)
-        }
-        do { try proceso.run(); pidScript = proceso.processIdentifier } catch {
-            s.ultimaLinea = "No pude lanzar el script: \(error.localizedDescription)"
-            terminar(s, codigo: 126)
-        }
+        RunLoop.main.add(t, forMode: .common)
+        s.cuenta = t
     }
 
-    /// Acumula bytes y procesa líneas completas (un trozo puede cortar una línea o traer varias).
-    func recibir(_ s: Sesion, _ datos: Data, stdout: Bool) {
-        let clave: Int32 = stdout ? 1 : 2
-        var buf = s.buffers[clave, default: Data()]
-        buf.append(datos)
-        while let nl = buf.firstIndex(of: 0x0A) {
-            let linea = String(decoding: buf[buf.startIndex..<nl], as: UTF8.self)
-            buf.removeSubrange(buf.startIndex...nl)
-            procesar(s, linea, stdout: stdout)
+    func capturar(_ s: Sesion, segundos: Double) {
+        estado = .iniciando
+        pintar()
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyyMMdd-HHmmss"
+        let carpeta = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Movies")
+        try? FileManager.default.createDirectory(at: carpeta, withIntermediateDirectories: true)
+        let g = Grabador(ruta: carpeta.appendingPathComponent("pantalla-\(f.string(from: Date())).mp4"), limite: segundos)
+        s.grabador = g
+        g.alEmpezar = { [weak self] in
+            guard let self, s === self.sesion, case .iniciando = self.estado else { return }
+            decir("GRABANDO")
+            self.inicio = Date()
+            self.estado = .grabando
+            self.temporizador?.invalidate()
+            let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.pintar() }
+            RunLoop.main.add(t, forMode: .common)
+            self.temporizador = t
+            self.pintar()
         }
-        s.buffers[clave] = buf
-    }
-
-    func procesar(_ s: Sesion, _ linea: String, stdout: Bool) {
-        if stdout, linea.hasPrefix("@estado ") {
-            guard s === sesion else { return }
-            let partes = linea.dropFirst(8).split(separator: " ", maxSplits: 1).map(String.init)
-            switch (partes.first, partes.count > 1 ? partes[1] : "") {
-            case ("cuenta", let n): estado = .cuenta(Int(n) ?? 0)
-            case ("iniciando", let p):
-                s.pidFfmpeg = pid_t(p) ?? 0
-                estado = .iniciando
-            case ("grabando", let p):
-                s.pidFfmpeg = pid_t(p) ?? 0
-                inicio = Date()
-                estado = .grabando
-                temporizador?.invalidate()
-                temporizador = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.pintar() }
-            case ("medida", let m): s.medida = m
-            case ("hecho", let ruta): s.rutaVideo = ruta
-            default: break
-            }
-            pintar()
+        g.alAcabar = { [weak self] final in self?.terminar(s, final) }
+        if pantalla.id == 0 {
+            terminar(s, .fallo("No hay pantalla \(pantalla.indice) (GRABAR_PANTALLA_INDICE)"))
             return
         }
-        FileHandle.standardError.write(Data((linea + "\n").utf8))
-        if !stdout, !linea.isEmpty { s.ultimaLinea = linea }
+        g.arrancar(pantalla: pantalla.id)
+    }
+
+    func formato(_ x: Double, decimales: Int = 1) -> String {
+        String(format: "%.\(decimales)f", locale: Locale.current, x)
     }
 
     // MARK: Acciones
@@ -372,15 +668,17 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     @objc func detener() {
-        guard case .grabando = estado, let s = sesion, s.pidFfmpeg > 0 else { return }
+        guard case .grabando = estado, let g = sesion?.grabador else { return }
         estado = .guardando
-        kill(s.pidFfmpeg, SIGINT)
+        g.detener()
         pintar()
     }
 
     @objc func cancelar() {
-        sesion?.cancelado = true
-        matarHijos { if !residente { exit(130) } }
+        guard let s = sesion else { return }
+        s.cancelado = true
+        s.cuenta?.invalidate()
+        if let g = s.grabador { g.cancelar() } else { terminar(s, .cancelado) }
     }
 
     @objc func grabarPunteroDesdeMenu() { empezar() }
@@ -393,7 +691,12 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     /// «Cerrar» tras un error: la terminal sale, la residente vuelve a espera.
     @objc func cerrar() {
-        if residente { volverAEspera(en: 0) } else { exit(sesion?.proceso.terminationStatus ?? 1) }
+        if residente { volverAEspera(en: 0) } else { salirDeTerminal(con: sesion?.codigo ?? 1) }
+    }
+
+    /// Salida del modo terminal; si `fotogramas` está trabajando, espera a que acabe.
+    func salirDeTerminal(con codigo: Int32) {
+        if sacandoFotogramas { salidaPendiente = codigo } else { exit(codigo) }
     }
 
     /// Pasado `segundos`, si nadie ha empezado otra grabación, vuelve al estado de espera.
@@ -409,25 +712,104 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if segundos <= 0 { hacer() } else { DispatchQueue.main.asyncAfter(deadline: .now() + segundos, execute: hacer) }
     }
 
-    /// El script ya terminó (y su salida está leída): hecho, error o cancelación.
-    func terminar(_ s: Sesion, codigo: Int32) {
+    /// La grabación acabó (mp4 cerrado, o nada): hecho, error o cancelación.
+    func terminar(_ s: Sesion, _ final: Grabador.Final, codigo: Int32 = 1) {
         guard s === sesion else { return }
         temporizador?.invalidate()
-        if s.cancelado || (interrumpido && s.rutaVideo == nil) {
-            if residente { volverAEspera(en: 0) } else { exit(codigo) }
-            return
+        s.cuenta?.invalidate()
+        switch final {
+        case .video(let n, let segundos):
+            let ruta = s.grabador?.ruta.path ?? ""
+            s.rutaVideo = ruta
+            ultimoVideo = ruta
+            let fps = segundos > 0 ? Double(n) / segundos : 0
+            s.medida = "\(n) fotogramas, ≈ \(formato(fps)) fps"
+            decir("Fotogramas: \(n) (≈ \(formato(fps)) fps en \(formato(segundos)) s)")
+            decir("Hecho: \(ruta)")
+        case .fallo(let m):
+            s.ultimaLinea = m
+            s.codigo = codigo
+            avisar(m)
+        case .cancelado:
+            s.codigo = 130
         }
-        if let ruta = s.rutaVideo, codigo == 0 {
+        // Cierre de la app: no hay ✓ ni ⚠ que enseñar.
+        if let alCerrar = s.alCerrar { alCerrar(); return }
+        switch final {
+        case .cancelado:
+            if residente { volverAEspera(en: 0) } else { salirDeTerminal(con: 130) }
+        case .video:
             estado = .hecho
             pintar()
-            notificar(ruta: ruta, medida: s.medida)
-            if residente { volverAEspera(en: 5) } else { DispatchQueue.main.asyncAfter(deadline: .now() + 5) { exit(0) } }
-        } else {
+            notificar(ruta: s.rutaVideo ?? "", medida: s.medida)
+            if residente { volverAEspera(en: 5) } else { DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [self] in salirDeTerminal(con: 0) } }
+        case .fallo:
             estado = .error
-            if s.ultimaLinea.isEmpty { s.ultimaLinea = "El script terminó con código \(codigo)" }
             pintar()
-            if residente { volverAEspera(en: 15) } else { DispatchQueue.main.asyncAfter(deadline: .now() + 15) { exit(codigo) } }
+            if residente { volverAEspera(en: 15) } else { DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [self] in salirDeTerminal(con: s.codigo) } }
         }
+    }
+
+    // MARK: Fotogramas
+
+    /// «Sacar fotogramas»: `fotogramas <vídeo>` (muestreo por defecto) y abre en Finder la carpeta
+    /// que imprime («Carpeta: …»). El script está junto a `grabar-pantalla` en el repo; si falta él
+    /// o ffmpeg, un aviso con lo que dijo.
+    @objc func sacarFotogramas() {
+        guard !sacandoFotogramas, let video = (sesion?.rutaVideo ?? ultimoVideo) else { return }
+        let herramienta = ((script as NSString).deletingLastPathComponent as NSString).appendingPathComponent("fotogramas")
+        guard !script.isEmpty, FileManager.default.isExecutableFile(atPath: herramienta) else {
+            alerta("No encuentro «fotogramas»", "Debería estar en \(script.isEmpty ? "el repo (falta GrabarPantallaScript en el Info.plist; reinstala con app/instalar.sh)" : herramienta).")
+            return
+        }
+        guard FileManager.default.fileExists(atPath: video) else {
+            alerta("El vídeo ya no está", video)
+            return
+        }
+        sacandoFotogramas = true
+        pintar()
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: herramienta)
+        p.arguments = [video]
+        // LaunchServices deja un PATH sin Homebrew; `fotogramas` lo añade, pero ffmpeg puede estar en otro sitio.
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = (env["PATH"] ?? "/usr/bin:/bin") + ":/opt/homebrew/bin:/usr/local/bin"
+        p.environment = env
+        let tubo = Pipe()
+        p.standardOutput = tubo
+        p.standardError = tubo
+        p.standardInput = FileHandle.nullDevice
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            var texto = ""
+            do {
+                try p.run()
+                texto = String(decoding: tubo.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                p.waitUntilExit()
+            } catch {
+                texto = "No pude lanzar \(herramienta): \(error.localizedDescription)"
+            }
+            let ok = p.processIdentifier > 0 && !p.isRunning && p.terminationStatus == 0
+            DispatchQueue.main.async { [self] in
+                sacandoFotogramas = false
+                pintar()
+                let lineas = texto.split(separator: "\n").map(String.init)
+                if ok, let c = lineas.first(where: { $0.hasPrefix("Carpeta: ") }) {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: String(c.dropFirst(9)), isDirectory: true))
+                } else {
+                    alerta("No pude sacar los fotogramas", lineas.suffix(3).joined(separator: "\n"))
+                }
+                if let c = salidaPendiente { exit(c) }
+            }
+        }
+    }
+
+    /// Aviso modal. La app es de barra de menús: hay que traerla delante para que se vea.
+    func alerta(_ titulo: String, _ texto: String) {
+        if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+        let a = NSAlert()
+        a.messageText = titulo
+        a.informativeText = texto
+        a.runModal()
     }
 
     // MARK: Icono y menú
@@ -460,6 +842,9 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             menu.addItem(i)
             return i
         }
+        func fotogramas(_ t: String) {
+            if sacandoFotogramas { fila("Sacando fotogramas…") } else { accion(t, #selector(sacarFotogramas)) }
+        }
         func pieResidente() {
             guard residente else { return }
             menu.addItem(.separator())
@@ -474,8 +859,8 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             boton?.title = ""
             accion("Grabar", #selector(grabarPunteroDesdeMenu), atajo: true)
             let sub = NSMenu()
-            for (i, p) in pantallasEnOrdenAvfoundation().enumerated() {
-                let it = NSMenuItem(title: p.localizedName, action: #selector(grabarPantallaDesdeMenu(_:)), keyEquivalent: "")
+            for (i, p) in pantallasEnOrden().enumerated() {
+                let it = NSMenuItem(title: p.pantalla.localizedName, action: #selector(grabarPantallaDesdeMenu(_:)), keyEquivalent: "")
                 it.target = self
                 it.tag = i
                 sub.addItem(it)
@@ -483,6 +868,10 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             let padre = NSMenuItem(title: "Grabar pantalla", action: nil, keyEquivalent: "")
             padre.submenu = sub
             menu.addItem(padre)
+            if let v = ultimoVideo, FileManager.default.fileExists(atPath: v) {
+                menu.addItem(.separator())
+                fotogramas("Sacar fotogramas de la última grabación")
+            }
             pieResidente()
         case .cuenta(let n):
             boton?.image = nil
@@ -514,6 +903,7 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             boton?.image = simbolo("checkmark.circle")
             boton?.title = ""
             accion("Mostrar en Finder", #selector(mostrarEnFinder))
+            fotogramas("Sacar fotogramas")
             if residente { accion("Grabar", #selector(grabarPunteroDesdeMenu), atajo: true) }
             pieResidente()
         case .error:
