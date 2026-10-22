@@ -47,8 +47,9 @@ let residente = argsTerminal.isEmpty
 /// a igual calidad, pero un vídeo para adjuntar tiene que abrirse en cualquier navegador y sistema.
 /// Los fps son los pedidos (`minimumFrameInterval` = 1/fps): ScreenCaptureKit solo entrega cuando
 /// cambia algo y como mucho al refresco de la pantalla, así que el vídeo sale con fps variable y las
-/// marcas de tiempo de la captura. El peso por minuto lo enseña la ventana; está medido grabando
-/// 15 s con una animación en una esquina de la pantalla integrada (README).
+/// marcas de tiempo de la captura. El peso por minuto lo enseña la ventana: es lo medido en dos
+/// tandas de 15 s de la pantalla integrada con una animación en una esquina y el escritorio en uso
+/// (README).
 enum Calidad: String, CaseIterable {
     case compacta, normal, animaciones
 
@@ -70,7 +71,8 @@ enum Calidad: String, CaseIterable {
         }
     }
 
-    /// Bitrate medio de H.264 en bits/s. Es un techo: con poco movimiento sale mucho menos.
+    /// Bitrate medio de H.264 en bits/s. Es un objetivo, no un límite estricto: con poco movimiento
+    /// sale mucho menos y en 15 s con mucho detalle puede pasarse algo (Compacta midió 2,9 Mb/s).
     var bitrate: Int {
         switch self {
         case .compacta: return 2_000_000
@@ -82,9 +84,9 @@ enum Calidad: String, CaseIterable {
     /// Lo que pesa un minuto con movimiento en pantalla (medido; ver arriba).
     var pesoPorMinuto: String {
         switch self {
-        case .compacta: return "≈ 17 MB por minuto"
-        case .normal: return "≈ 52 MB por minuto"
-        case .animaciones: return "≈ 110 MB por minuto"
+        case .compacta: return "≈ 17-22 MB por minuto"
+        case .normal: return "≈ 52-73 MB por minuto"
+        case .animaciones: return "≈ 110-210 MB por minuto"
         }
     }
 

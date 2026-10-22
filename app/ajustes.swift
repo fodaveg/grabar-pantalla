@@ -292,7 +292,7 @@ final class VentanaAjustes: NSWindowController, NSWindowDelegate {
             radiosCalidad.append(r)
             opciones.append(pila([r, sangrada(nota(c.descripcion, sangria: 20))], espacio: 1))
         }
-        opciones.append(nota("Peso medido con una animación en pantalla; con la pantalla quieta, mucho menos."))
+        opciones.append(nota("Peso medido con una animación y el escritorio en uso; con la pantalla quieta, mucho menos."))
         filas.append([etiqueta("Calidad:"), pila(opciones, espacio: 8)])
         separador()
 

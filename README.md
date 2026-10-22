@@ -107,17 +107,19 @@ El atajo ⌃⌥⌘R aparece en la ventana como información; no se cambia.
 
 Las tres calidades son H.264 y las mismas marcas de tiempo variables de la captura. HEVC pesaría
 menos, pero Compacta es para adjuntar y un mp4 en HEVC no se ve en todos los navegadores. Peso
-medido grabando 15 s de la integrada (3024x1964) con una animación en una esquina y el resto del
-escritorio quieto, en un MacBook Pro con carga 7-9:
+medido en un MacBook Pro grabando 15 s de la integrada (3024x1964) con una animación en una
+esquina, en dos tandas: A con el resto del escritorio casi quieto (carga 7-9) y B con texto
+escribiéndose y desplazándose en otra app (carga 12-15). La ventana enseña el intervalo.
 
-| Calidad | fps medidos | Vídeo | Peso |
-|---|---|---|---|
-| Compacta | 29,1 | 2,2 Mb/s | 17 MB/min |
-| Normal | 56,5 | 6,9 Mb/s | 52 MB/min |
-| Animaciones | 101,5 (intervalos de 8,3 ms de mediana, 25 ms de máximo) | 14,6 Mb/s | 110 MB/min |
+| Calidad | fps medidos (A / B) | Intervalos min / mediana / máx (A) | Vídeo (A / B) | Peso (A / B) |
+|---|---|---|---|---|
+| Compacta | 29,1 / 28,4 | 25,0 / 33,3 / 50,0 ms | 2,2 / 2,9 Mb/s | 17 / 22 MB/min |
+| Normal | 56,5 / 56,1 | 8,3 / 16,7 / 33,3 ms | 6,9 / 9,7 Mb/s | 52 / 73 MB/min |
+| Animaciones | 101,5 / 94,3 | 8,3 / 8,3 / 25,0 ms | 14,6 / 27,5 Mb/s | 110 / 206 MB/min |
 
-El bitrate de cada calidad es un techo: con la pantalla quieta pesa mucho menos y con mucho
-movimiento a pantalla completa puede llegar a él (15, 90 y 300 MB/min).
+El bitrate de cada calidad es un objetivo medio, no un límite estricto: con la pantalla quieta pesa
+mucho menos y en una grabación corta con mucho detalle puede pasarse algo (Compacta, 2,9 Mb/s con
+un objetivo de 2).
 
 El audio va en pistas AAC de 48 kHz del mismo mp4, una por fuente (sistema, estéreo; micrófono,
 mono), con las marcas de tiempo de la captura, así que está sincronizado con la imagen. Con las dos
