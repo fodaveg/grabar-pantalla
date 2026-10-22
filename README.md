@@ -6,9 +6,11 @@ Spotlight o desde la terminal.
 - Captura con `avfoundation` (puntero y clics marcados) y codifica en H.264 por hardware
   (VideoToolbox). Medido en un MacBook Pro: unos 80 fps.
 - Graba la pantalla donde está el puntero al arrancar.
-- Icono en la barra de menús: cuenta atrás, punto rojo con el tiempo, «Guardando…», ✓ al acabar
-  y ⚠ si la captura no arranca.
-- Clic derecho en el icono: detiene la grabación. Clic izquierdo: menú.
+- App residente en la barra de menús: en espera (icono gris), cuenta atrás, punto rojo con el
+  tiempo, «Guardando…», ✓ al acabar (y de vuelta a espera) y ⚠ si la captura no arranca.
+- Clic izquierdo en el icono: detiene si graba (cancela en la cuenta atrás) y abre el menú en
+  espera. Clic derecho o Control + clic: abren el menú siempre.
+- Atajo global ⌃⌥⌘R para empezar y detener.
 - Deja el vídeo en `~/Movies/pantalla-AAAAMMDD-HHMMSS.mp4`.
 
 ## Requisitos
@@ -34,12 +36,31 @@ La primera vez macOS pide el permiso de «Grabación de pantalla» para «Grabar
 la terminal, si no hay app). Si ffmpeg no consigue capturar en 10 s, la app lo avisa y dice
 dónde activarlo.
 
+La primera vez que graba, la app pide permiso para enviar notificaciones: hay que aceptarlo para
+ver el aviso «Grabación terminada» (con «Mostrar» y «Copiar ruta»). Se cambia en Ajustes del
+Sistema > Notificaciones.
+
 ## Usar
 
 | Desde | Cómo | Duración |
 |---|---|---|
-| Spotlight | «Grabar pantalla» | Hasta pulsar Detener (tope de 30 min). Volver a abrirla también detiene. |
+| Spotlight, Finder, `open` | «Grabar pantalla» | Graba al instante la pantalla del puntero, hasta Detener (tope de 30 min). |
 | Terminal | `grabar-pantalla [segundos]` | 15 s por defecto; `0` = hasta Detener |
+
+La app de Spotlight es residente: tras cada grabación vuelve a espera y se queda en la barra de
+menús hasta «Salir» (⌘Q). Si ya está abierta, abrirla otra vez detiene la grabación en curso o,
+en espera, empieza una. Arrancada como ítem de inicio de sesión queda en espera sin grabar.
+
+En espera, el menú tiene «Grabar» (pantalla del puntero), «Grabar pantalla ▸» (una entrada por
+pantalla), «Ajustes…» (todavía deshabilitado) y «Salir». El atajo global ⌃⌥⌘R empieza y detiene
+desde cualquier app, sin permiso de Accesibilidad.
+
+Al terminar, una notificación con el número de fotogramas y los fps ofrece «Mostrar» (Finder; es
+también lo que hace pulsarla) y «Copiar ruta».
+
+`grabar-pantalla` en la terminal es un proceso aparte de un solo uso: espera hasta el final,
+imprime la ruta, devuelve el código de salida y no reutiliza la app residente (conviven; durante
+esa grabación hay dos iconos en la barra).
 
 Para forzar una pantalla: `GRABAR_PANTALLA_INDICE=1 grabar-pantalla 10`. El número es el de
 `Capture screen N` en `ffmpeg -f avfoundation -list_devices true -i ""`.
@@ -47,9 +68,11 @@ Para forzar una pantalla: `GRABAR_PANTALLA_INDICE=1 grabar-pantalla 10`. El núm
 ## Cómo está hecho
 
 - `grabar-pantalla`: script de zsh con toda la lógica de grabación. Si la app está instalada, se
-  relanza a través de ella para que salga el icono.
-- `app/main.swift`: la app de la barra de menús. Lanza el script como hijo y lee de su salida
-  las líneas `@estado …`.
+  relanza a través de ella para que salga el icono. Con la app no avisa por `osascript`: la
+  notificación es de la app.
+- `app/main.swift`: la app de la barra de menús. Sin argumentos es residente (espera, atajo
+  global, un `Process` nuevo por grabación); con argumentos, de un solo uso para la terminal.
+  Lanza el script como hijo y lee de su salida las líneas `@estado …`.
 - `app/icono.swift`: dibuja el icono de la app (círculo rojo con una pantalla).
 - `app/instalar.sh`: compila, monta el bundle, genera el icono y firma.
 
