@@ -8,13 +8,15 @@
 # necesariamente la integrada; el orden es el de CGGetActiveDisplayList, el mismo que numeraba
 # ffmpeg con «Capture screen N»). Sin la variable, la de donde está el puntero al arrancar.
 # Forzarla a mano: GRABAR_PANTALLA_INDICE=1 grabar-pantalla 10
-# Deja el vídeo en ~/Movies/pantalla-AAAAMMDD-HHMMSS.mp4. La primera vez macOS pide permiso de
-# «Grabación de pantalla» para «Grabar pantalla» (si la app quedó con firma ad hoc, lo vuelve a
-# pedir tras cada reinstalación).
+# Deja el vídeo en ~/Movies/pantalla-AAAAMMDD-HHMMSS.mp4 o en la carpeta de los Ajustes de la app.
+# La primera vez macOS pide permiso de «Grabación de pantalla» (si la app quedó con firma ad hoc,
+# lo vuelve a pedir tras cada reinstalación).
 # Desde la terminal la app es un proceso propio de un solo uso (no toca la residente de la barra
 # de menús): este script resuelve el valor por defecto (15) ANTES del exec para que la app reciba
-# argumentos. Imprime la cuenta, «GRABANDO», los fotogramas y fps escritos y la ruta; sale con 0
-# si hay vídeo válido. Ctrl-C detiene y deja el mp4 cerrado.
+# argumentos. Lee los Ajustes de la app (carpeta, calidad, cuenta atrás, puntero, audio, al
+# terminar) igual que la residente; la duración es siempre la de aquí. Imprime la cuenta,
+# «GRABANDO», los fotogramas y fps escritos y la ruta; sale con 0 si hay vídeo válido. Ctrl-C
+# detiene y deja el mp4 cerrado.
 # Instalar o reinstalar la app (tras tocar su código): app/instalar.sh
 set -euo pipefail
 app=~/"Applications/Grabar pantalla.app/Contents/MacOS/grabar-pantalla"

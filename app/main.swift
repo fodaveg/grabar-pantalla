@@ -1,19 +1,23 @@
 // Grabar pantalla: app de barra de menús que graba una pantalla del Mac. La captura es
 // ScreenCaptureKit (`SCStream` de la pantalla elegida, sin la propia app) y la escritura,
-// `AVAssetWriter` (mp4, H.264 por hardware), todo en este proceso: no hay ffmpeg ni script hijo.
-// Deja el vídeo en ~/Movies/pantalla-AAAAMMDD-HHMMSS.mp4.
+// `AVAssetWriter` (mp4, H.264 por hardware y audio AAC), todo en este proceso: no hay ffmpeg ni
+// script hijo. Deja el vídeo en la carpeta de los Ajustes (por defecto ~/Movies) como
+// pantalla-AAAAMMDD-HHMMSS.mp4.
 //
 // Dos modos, según los argumentos:
 // - Residente (sin argumentos: LaunchServices desde Spotlight, Finder, `open` o el inicio de
 //   sesión): se queda en la barra de menús en espera y graba una vez por petición, hasta Detener
-//   (tope de 30 min). Abierta normalmente graba al instante; como ítem de inicio de sesión queda
-//   en espera. Registra el atajo global.
+//   (tope de 30 min) o los segundos de los Ajustes. Abierta normalmente graba al instante; como
+//   ítem de inicio de sesión queda en espera. Registra el atajo global y tiene la ventana de Ajustes.
 // - Terminal (con argumentos, que pone el script `grabar-pantalla [segundos]` al hacer exec):
 //   proceso propio de un solo uso. Graba, imprime el resultado y sale con 0 si hay vídeo válido.
-//   No toca la residente.
+//   No toca la residente, pero lee los mismos Ajustes (salvo la duración, que es su argumento).
+//
+// Los Ajustes (UserDefaults y ventana) están en ajustes.swift; se leen al empezar cada grabación.
 import AppKit
 import AVFoundation
 import Carbon.HIToolbox
+import os
 import ScreenCaptureKit
 import UserNotifications
 import VideoToolbox
@@ -23,21 +27,78 @@ import VideoToolbox
 /// Ruta del script `grabar-pantalla` del repo (la pone instalar.sh). Solo sirve para encontrar
 /// `fotogramas`, que vive a su lado.
 let script = Bundle.main.object(forInfoDictionaryKey: "GrabarPantallaScript") as? String ?? ""
-// LaunchServices puede añadir -psn_... o -NS...; no son de la terminal.
-let argsTerminal = Array(CommandLine.arguments.dropFirst()).filter { !$0.hasPrefix("-psn_") && !$0.hasPrefix("-NS") && !$0.hasPrefix("-Apple") }
+/// Argumentos de la terminal. LaunchServices puede añadir `-psn_…`, y AppKit acepta pares
+/// `-NSClave valor` o `-AppleClave valor` (p. ej. `-AppleInterfaceStyle Dark`): ni la opción ni su
+/// valor son de la terminal.
+let argsTerminal: [String] = {
+    var r: [String] = []
+    var saltarValor = false
+    for a in CommandLine.arguments.dropFirst() {
+        if saltarValor { saltarValor = false; continue }
+        if a.hasPrefix("-psn_") { continue }
+        if a.hasPrefix("-NS") || a.hasPrefix("-Apple") { saltarValor = true; continue }
+        r.append(a)
+    }
+    return r
+}()
 let residente = argsTerminal.isEmpty
 
-/// Calidad de la captura y del vídeo. Hoy fija; los Ajustes la cambiarán aquí.
-struct Calidad {
-    /// Fotogramas por segundo pedidos (`minimumFrameInterval` = 1/fps). ScreenCaptureKit solo
-    /// entrega cuando cambia algo y como mucho al refresco de la pantalla: el vídeo sale con fps
-    /// variable, con las marcas de tiempo de la captura.
-    var fps: Int32 = 120
-    /// Bitrate medio de H.264 en bits/s (40 Mb/s, lo mismo que se usaba con ffmpeg).
-    var bitrate = 40_000_000
+/// Calidad de la captura y del vídeo, la que se elige en Ajustes. H.264 en las tres: HEVC pesa menos
+/// a igual calidad, pero un vídeo para adjuntar tiene que abrirse en cualquier navegador y sistema.
+/// Los fps son los pedidos (`minimumFrameInterval` = 1/fps): ScreenCaptureKit solo entrega cuando
+/// cambia algo y como mucho al refresco de la pantalla, así que el vídeo sale con fps variable y las
+/// marcas de tiempo de la captura. El peso por minuto lo enseña la ventana; está medido grabando
+/// 15 s con una animación en una esquina de la pantalla integrada (README).
+enum Calidad: String, CaseIterable {
+    case compacta, normal, animaciones
+
+    var nombre: String {
+        switch self {
+        case .compacta: return "Compacta"
+        case .normal: return "Normal"
+        case .animaciones: return "Animaciones"
+        }
+    }
+
+    /// fps pedidos en la pantalla `id`. Animaciones pide todos los que dé: su refresco máximo (120
+    /// en la integrada con ProMotion, 75 en una externa a 75 Hz).
+    func fps(pantalla id: CGDirectDisplayID) -> Int32 {
+        switch self {
+        case .compacta: return 30
+        case .normal: return 60
+        case .animaciones: return Int32(refrescoMaximo(id))
+        }
+    }
+
+    /// Bitrate medio de H.264 en bits/s. Es un techo: con poco movimiento sale mucho menos.
+    var bitrate: Int {
+        switch self {
+        case .compacta: return 2_000_000
+        case .normal: return 12_000_000
+        case .animaciones: return 40_000_000
+        }
+    }
+
+    /// Lo que pesa un minuto con movimiento en pantalla (medido; ver arriba).
+    var pesoPorMinuto: String {
+        switch self {
+        case .compacta: return "≈ 17 MB por minuto"
+        case .normal: return "≈ 52 MB por minuto"
+        case .animaciones: return "≈ 110 MB por minuto"
+        }
+    }
+
+    /// Una línea para la ventana: fps, peso y para qué sirve.
+    var descripcion: String {
+        switch self {
+        case .compacta: return "30 fps, \(pesoPorMinuto). Para adjuntar."
+        case .normal: return "60 fps, \(pesoPorMinuto)."
+        case .animaciones: return "Todos los fps de la pantalla (120 en la integrada), \(pesoPorMinuto). Para revisar animaciones."
+        }
+    }
 }
-let calidad = Calidad()
-/// Tope de seguridad de «hasta Detener» (residente, o `grabar-pantalla 0`).
+/// Tope de seguridad de «hasta Detener» (residente, o `grabar-pantalla 0`) y de la duración de los
+/// Ajustes. No se ajusta.
 let topeSegundos: Double = 30 * 60
 let mensajePermiso = "La captura no arranca. Revisa Ajustes del Sistema > Privacidad y seguridad > Grabación de pantalla y audio del sistema: «Grabar pantalla» debe estar activado"
 
@@ -56,6 +117,14 @@ func pantallasEnOrden() -> [(id: CGDirectDisplayID, pantalla: NSScreen)] {
     return ids.prefix(Int(n)).compactMap { id in
         NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id }.map { (id, $0) }
     }
+}
+
+/// Refresco máximo de la pantalla `id` en Hz: el de ProMotion (`maximumFramesPerSecond`) o, si
+/// AppKit no la conoce, el del modo actual; 60 si nadie lo sabe.
+func refrescoMaximo(_ id: CGDirectDisplayID) -> Int {
+    if let p = pantallasEnOrden().first(where: { $0.id == id })?.pantalla, p.maximumFramesPerSecond > 0 { return p.maximumFramesPerSecond }
+    if let hz = CGDisplayCopyDisplayMode(id)?.refreshRate, hz > 0 { return Int(hz.rounded()) }
+    return 60
 }
 
 /// Pantalla que se graba: la pedida explícitamente (submenú), la que fije GRABAR_PANTALLA_INDICE
@@ -83,16 +152,31 @@ signal(SIGHUP, alSenal)
 
 // MARK: - Captura
 
+/// Lo que pide una grabación a la captura, sacado de los Ajustes al empezar.
+struct Peticion {
+    var fps: Int32
+    var bitrate: Int
+    var puntero = true
+    /// Solo en macOS 15 o posterior; antes no existe.
+    var clics = true
+    var audioSistema = false
+    /// Solo en macOS 15 o posterior, y con el permiso de micrófono ya concedido.
+    var microfono = false
+}
+
 /// Una captura: `SCStream` de una pantalla → `AVAssetWriter`. Todo lo que toca el escritor corre en
-/// `cola`, la misma en la que ScreenCaptureKit entrega los fotogramas: añadir uno y cerrar el fichero
-/// no se pisan. Los avisos al controlador (`alEmpezar`, `alAcabar`) llegan por el hilo principal.
-/// Cada fotograma se escribe al llegar el siguiente, con su duración real: así el último dura hasta
-/// el corte aunque la pantalla llevara un rato quieta (sin esto el mp4 acaba en el último cambio).
+/// `cola`, la misma en la que ScreenCaptureKit entrega fotogramas y audio: añadir una muestra y
+/// cerrar el fichero no se pisan. Los avisos al controlador (`alEmpezar`, `alAcabar`) llegan por el
+/// hilo principal. Cada fotograma se escribe al llegar el siguiente, con su duración real: así el
+/// último dura hasta el corte aunque la pantalla llevara un rato quieta (sin esto el mp4 acaba en el
+/// último cambio). El audio (sistema y micrófono, cada uno en su pista AAC) lleva las marcas de
+/// tiempo del mismo reloj que el vídeo: lo anterior al primer fotograma se descarta.
 final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
     enum Final { case video(fotogramas: Int, segundos: Double), fallo(String), cancelado }
 
     let ruta: URL
     let limite: Double
+    let peticion: Peticion
     /// Primer fotograma escrito: la grabación ya corre.
     var alEmpezar: () -> Void = {}
     /// Se llama una sola vez, con el mp4 ya cerrado (o borrado si no vale).
@@ -102,6 +186,16 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private var escritor: AVAssetWriter?
     private var entrada: AVAssetWriterInput?
+    /// Pistas de audio: la del sistema y la del micrófono (cada una si se pidió).
+    private var entradaSistema: AVAssetWriterInput?
+    private var entradaMicro: AVAssetWriterInput?
+    /// Muestras de audio que el escritor no pudo aceptar (se avisa al acabar si hay alguna).
+    private var audioPerdido = 0
+    /// Audio llegado antes del primer fotograma: espera a saber dónde empieza la sesión (64 bloques
+    /// como mucho). Medido en un MacBook Pro con macOS 27, el audio del sistema arranca unos 15 ms
+    /// después del primer fotograma y esto queda vacío; la pista empieza entonces con ese hueco, en
+    /// su sitio.
+    private var audioPrevio: [(muestra: CMSampleBuffer, sistema: Bool)] = []
     private var primero: CMTime?
     /// Fotograma completo que espera al siguiente (o al corte) para saber cuánto dura.
     private var retenido: CMSampleBuffer?
@@ -111,9 +205,10 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Detener, cancelar o fallo: ya no entra ningún fotograma más.
     private var cerrado = false
 
-    init(ruta: URL, limite: Double) {
+    init(ruta: URL, limite: Double, peticion: Peticion) {
         self.ruta = ruta
         self.limite = limite
+        self.peticion = peticion
     }
 
     /// Pide el contenido compartible, monta filtro, stream y escritor, y arranca. Sin permiso de
@@ -154,23 +249,32 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
         let cfg = SCStreamConfiguration()
         cfg.width = ancho
         cfg.height = alto
-        cfg.minimumFrameInterval = CMTime(value: 1, timescale: calidad.fps)
+        cfg.minimumFrameInterval = CMTime(value: 1, timescale: peticion.fps)
         // 8 es el máximo recomendado: el codificador retiene los búferes mientras trabaja y con
         // menos la captura se atasca a 120 fps.
         cfg.queueDepth = 8
-        cfg.showsCursor = true
-        // Los clics marcados solo los pinta ScreenCaptureKit en BGRA (cabecera de SCStream); en
-        // macOS 13-14 no hay marcado y se captura en 4:2:0, que es lo que come VideoToolbox.
-        if #available(macOS 15.0, *) {
+        cfg.showsCursor = peticion.puntero
+        // Los clics marcados solo los pinta ScreenCaptureKit en BGRA (cabecera de SCStream). Sin
+        // marcado (macOS 13-14, o desactivado) se captura en 4:2:0, que es lo que come VideoToolbox.
+        cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        if #available(macOS 15.0, *), peticion.clics {
             cfg.pixelFormat = kCVPixelFormatType_32BGRA
             cfg.showMouseClicks = true
-        } else {
-            cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         }
         cfg.colorSpaceName = CGColorSpace.sRGB
         cfg.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2
-        // Audio (para los Ajustes): cfg.capturesAudio = true, una segunda salida
-        // `addStreamOutput(self, type: .audio, …)` en esta misma cola y una entrada AAC en el escritor.
+        // Audio del sistema: el de todo el Mac menos esta app (sus sonidos de aviso no se graban).
+        if peticion.audioSistema {
+            cfg.capturesAudio = true
+            cfg.excludesCurrentProcessAudio = true
+            cfg.sampleRate = 48_000
+            cfg.channelCount = 2
+        }
+        // Micrófono: el de por defecto del sistema.
+        if #available(macOS 15.0, *), peticion.microfono {
+            cfg.captureMicrophone = true
+            cfg.microphoneCaptureDeviceID = AVCaptureDevice.default(for: .audio)?.uniqueID
+        }
         do {
             // AVAssetWriter no sobrescribe: si existe (dos grabaciones en el mismo segundo), fuera.
             try? FileManager.default.removeItem(at: ruta)
@@ -181,8 +285,8 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
                 AVVideoHeightKey: alto,
                 AVVideoEncoderSpecificationKey: [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: true],
                 AVVideoCompressionPropertiesKey: [
-                    AVVideoAverageBitRateKey: calidad.bitrate,
-                    AVVideoExpectedSourceFrameRateKey: calidad.fps,
+                    AVVideoAverageBitRateKey: peticion.bitrate,
+                    AVVideoExpectedSourceFrameRateKey: peticion.fps,
                     AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
                     // Sin fotogramas B: con fps variable las marcas de tiempo salen tal cual.
                     AVVideoAllowFrameReorderingKey: false,
@@ -200,9 +304,26 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
             entrada.mediaTimeScale = 90_000
             guard escritor.canAdd(entrada) else { fallar("El escritor de vídeo no acepta H.264 a \(ancho)x\(alto)"); return }
             escritor.add(entrada)
+            // Una pista por fuente y no una mezcla: mezclar exige alinear y remuestrear dos relojes
+            // de audio en vivo, y si uno se retrasa se lleva al otro. Con dos pistas cada una lleva
+            // sus marcas de tiempo tal cual. QuickTime reproduce las dos a la vez.
+            if peticion.audioSistema {
+                let e = Grabador.entradaAAC(canales: 2, bitrate: 128_000)
+                guard escritor.canAdd(e) else { fallar("El escritor no acepta la pista de audio del sistema"); return }
+                escritor.add(e)
+                entradaSistema = e
+            }
+            if peticion.microfono {
+                let e = Grabador.entradaAAC(canales: 1, bitrate: 96_000)
+                guard escritor.canAdd(e) else { fallar("El escritor no acepta la pista del micrófono"); return }
+                escritor.add(e)
+                entradaMicro = e
+            }
             guard escritor.startWriting() else { fallar("No puedo escribir \(ruta.path): \(describir(escritor.error))"); return }
             let stream = SCStream(filter: filtro, configuration: cfg, delegate: self)
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: cola)
+            if peticion.audioSistema { try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: cola) }
+            if #available(macOS 15.0, *), peticion.microfono { try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: cola) }
             self.escritor = escritor
             self.entrada = entrada
             self.stream = stream
@@ -260,7 +381,7 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let entrada else { return }
         let pts = m.presentationTimeStamp
         // Nunca menos de un intervalo de captura: un fotograma de duración 0 no se vería.
-        let duracion = CMTimeMaximum(fin - pts, CMTime(value: 1, timescale: calidad.fps))
+        let duracion = CMTimeMaximum(fin - pts, CMTime(value: 1, timescale: peticion.fps))
         var t = CMSampleTimingInfo(duration: duracion, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
         var copia: CMSampleBuffer?
         guard CMSampleBufferCreateCopyWithNewTiming(allocator: nil, sampleBuffer: m, sampleTimingEntryCount: 1,
@@ -294,6 +415,10 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         let n = fotogramas, fin = finEscrito
         entrada.markAsFinished()
+        entradaSistema?.markAsFinished()
+        entradaMicro?.markAsFinished()
+        if audioPerdido > 0 { avisar("Aviso: el escritor no aceptó \(audioPerdido) bloque(s) de audio; puede haber cortes en el sonido") }
+        // El audio que pase del último fotograma se recorta aquí: todas las pistas acaban con el vídeo.
         escritor.endSession(atSourceTime: fin)
         escritor.finishWriting { [self] in
             if escritor.status == .completed {
@@ -307,6 +432,40 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func acabar(_ f: Final) { DispatchQueue.main.async { [self] in alAcabar(f) } }
 
+    /// Entrada AAC a 48 kHz. El escritor convierte lo que llegue (PCM de ScreenCaptureKit, con sus
+    /// canales y frecuencia) a esto.
+    static func entradaAAC(canales: Int, bitrate: Int) -> AVAssetWriterInput {
+        var disposicion = AudioChannelLayout()
+        disposicion.mChannelLayoutTag = canales == 1 ? kAudioChannelLayoutTag_Mono : kAudioChannelLayoutTag_Stereo
+        let e = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: 48_000,
+            AVNumberOfChannelsKey: canales,
+            AVChannelLayoutKey: Data(bytes: &disposicion, count: MemoryLayout<AudioChannelLayout>.size),
+            AVEncoderBitRateKey: bitrate,
+        ])
+        e.expectsMediaDataInRealTime = true
+        return e
+    }
+
+    /// Una muestra de audio a su pista, solo si suena entre el primer fotograma y el corte. Antes del
+    /// primer fotograma se guarda en `audioPrevio`. Un bloque que empieza antes del primer fotograma y
+    /// acaba después entra entero: el escritor deja fuera (lista de edición) lo anterior al inicio
+    /// de la sesión, así que el audio de antes se descarta igual y la pista empieza en t = 0.
+    private func anadirAudio(_ m: CMSampleBuffer, a entrada: AVAssetWriterInput?) {
+        guard !cerrado, let entrada, let escritor, escritor.status == .writing, m.isValid,
+              CMSampleBufferGetNumSamples(m) > 0 else { return }
+        guard let primero else {
+            audioPrevio.append((m, entrada === entradaSistema))
+            if audioPrevio.count > 64 { audioPrevio.removeFirst() }
+            return
+        }
+        let pts = m.presentationTimeStamp
+        guard pts + m.duration > primero, pts < primero + CMTime(seconds: limite, preferredTimescale: 1_000_000_000) else { return }
+        guard entrada.isReadyForMoreMediaData else { audioPerdido += 1; return }
+        if !entrada.append(m) { audioPerdido += 1 }
+    }
+
     private func describir(_ e: Error?) -> String {
         guard let e else { return "error desconocido" }
         if (e as NSError).domain == SCStreamErrorDomain, (e as NSError).code == SCStreamError.Code.userDeclined.rawValue { return mensajePermiso }
@@ -316,7 +475,8 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: SCStreamOutput, SCStreamDelegate
 
     func stream(_ stream: SCStream, didOutputSampleBuffer muestra: CMSampleBuffer, of tipo: SCStreamOutputType) {
-        // Aquí entrará `.audio` cuando los Ajustes lo activen (a su propia entrada del escritor).
+        if tipo == .audio { anadirAudio(muestra, a: entradaSistema); return }
+        if #available(macOS 15.0, *), tipo == .microphone { anadirAudio(muestra, a: entradaMicro); return }
         guard tipo == .screen, !cerrado, let escritor, muestra.isValid else { return }
         // Solo fotogramas completos: los `.idle` (pantalla quieta) y similares no traen imagen nueva.
         guard let info = CMSampleBufferGetSampleAttachmentsArray(muestra, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
@@ -330,6 +490,10 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
             // La sesión empieza en el primer fotograma completo: el vídeo arranca en t = 0 con imagen.
             escritor.startSession(atSourceTime: pts)
             primero = pts
+            // El audio que esperaba: entra el que suene desde este fotograma (ver `anadirAudio`).
+            let previo = audioPrevio
+            audioPrevio = []
+            for p in previo { anadirAudio(p.muestra, a: p.sistema ? entradaSistema : entradaMicro) }
             // Con la pantalla quieta no llegan fotogramas que disparen el corte de arriba.
             cola.asyncAfter(deadline: .now() + limite) { [self] in
                 finalizar(hasta: pts + CMTime(seconds: limite, preferredTimescale: 1_000_000_000))
@@ -358,6 +522,10 @@ enum Estado { case espera, cuenta(Int), iniciando, grabando, guardando, hecho, e
 /// Una grabación: su cuenta atrás, su `Grabador` y lo que acabó dejando. Cada grabación estrena la
 /// suya, y lo que llega de una anterior (aviso rezagado) se ignora comparando identidades.
 final class Sesion {
+    /// Los Ajustes leídos al empezar esta grabación: cambiarlos después no la toca.
+    var ajustes = Ajustes.leer()
+    /// La carpeta elegida no valía y se guarda en ~/Movies: por qué.
+    var avisoCarpeta: String?
     var cuenta: Timer?
     var grabador: Grabador?
     var rutaVideo: String?
@@ -392,9 +560,14 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var sacandoFotogramas = false
     /// Modo terminal: salida aplazada hasta que acabe `fotogramas`.
     var salidaPendiente: Int32?
+    /// La ventana de Ajustes, creada la primera vez que se abre.
+    var ventanaAjustes: VentanaAjustes?
+    /// «Ajustes…» del menú principal (⌘, con la ventana delante), para deshabilitarlo grabando.
+    var ajustesPrincipal: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        if residente { montarMenuPrincipal() }
         pantalla = elegirPantalla()
         item.button?.target = self
         item.button?.action = #selector(clicEnIcono)
@@ -413,14 +586,17 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         configurarNotificaciones()
         if residente { registrarAtajo() }
         guard residente else {
-            estado = .cuenta(3)
-            pintar()
             lanzar()
             return
         }
         estado = .espera
         pintar()
-        if lanzadaComoItemDeInicio() { return }
+        let comoItem = lanzadaComoItemDeInicio()
+        // Queda en el registro del sistema, para comprobar tras iniciar sesión que macOS manda la marca:
+        // /usr/bin/log show --last 10m --predicate 'subsystem == "net.fodaveg.grabar-pantalla"'
+        let registro = Logger(subsystem: "net.fodaveg.grabar-pantalla", category: "arranque")
+        if comoItem { registro.notice("Arranque residente como ítem de inicio de sesión: queda en espera") } else { registro.notice("Arranque residente normal: graba") }
+        if comoItem { return }
         // Un clic en una notificación de una instancia ya muerta relanza la app por LaunchServices
         // sin argumentos: la respuesta llega justo después del arranque y no debe empezar a grabar.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [self] in
@@ -536,14 +712,23 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         centro.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    func notificar(ruta: String, medida: String) {
+    func notificar(ruta: String, medida: String, sonido: Bool) {
         let c = UNMutableNotificationContent()
         c.title = "Grabación terminada"
         c.subtitle = (ruta as NSString).lastPathComponent
         c.body = medida
-        c.sound = .default
+        c.sound = sonido ? .default : nil
         c.categoryIdentifier = categoriaNotificacion
         c.userInfo = ["ruta": ruta]
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)) { _ in }
+    }
+
+    /// Aviso suelto (carpeta no disponible, micrófono sin permiso): siempre se manda, aunque la
+    /// notificación de «Grabación terminada» esté desactivada, porque cambia dónde o qué se graba.
+    func notificarAviso(_ titulo: String, _ texto: String) {
+        let c = UNMutableNotificationContent()
+        c.title = titulo
+        c.body = texto
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)) { _ in }
     }
 
@@ -574,29 +759,37 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func empezar(indice: Int? = nil) {
         tokenEspera += 1
         pantalla = elegirPantalla(forzada: indice)
-        estado = .cuenta(3)
-        pintar()
         lanzar()
     }
 
-    /// Segundos de la grabación: los de la terminal (0 = hasta Detener) o, en la residente, hasta Detener.
-    func segundosPedidos() -> Double? {
-        guard let a = argsTerminal.first else { return 0 }
-        guard let n = Double(a.replacingOccurrences(of: ",", with: ".")), n >= 0, n.isFinite else { return nil }
+    /// Segundos de la grabación (0 = hasta Detener): en la terminal, su argumento; en la residente,
+    /// la duración de los Ajustes.
+    func segundosPedidos(_ a: Ajustes) -> Double? {
+        guard let t = argsTerminal.first else { return Double(a.duracion) }
+        guard let n = Double(t.replacingOccurrences(of: ",", with: ".")), n >= 0, n.isFinite else { return nil }
         return n
     }
 
-    /// Cuenta atrás de 3 s y, al acabar, la captura.
+    /// Lee los Ajustes y hace la cuenta atrás que digan; al acabar (o al momento, con 0), la captura.
     func lanzar() {
         let s = Sesion()
         sesion = s
-        guard let segundos = segundosPedidos() else {
+        guard let segundos = segundosPedidos(s.ajustes) else {
             s.ultimaLinea = "Uso: grabar-pantalla [segundos]   (0 = hasta Detener)"
             terminar(s, .fallo(s.ultimaLinea), codigo: 2)
             return
         }
-        decir(segundos == 0 ? "Grabando hasta Detener (máx. 30 min) en 3 s…" : "Grabando \(formato(segundos, decimales: segundos.rounded() == segundos ? 0 : 1)) s en 3 s…")
-        var n = 3
+        let cuenta = s.ajustes.cuentaAtras
+        let cuando = cuenta > 0 ? "en \(cuenta) s" : "sin cuenta atrás"
+        decir(segundos == 0 ? "Grabando hasta Detener (máx. 30 min) \(cuando)…" : "Grabando \(formato(segundos, decimales: segundos.rounded() == segundos ? 0 : 1)) s \(cuando)…")
+        let limite = segundos == 0 ? topeSegundos : min(segundos, topeSegundos)
+        guard cuenta > 0 else {
+            capturar(s, segundos: limite)
+            return
+        }
+        estado = .cuenta(cuenta)
+        pintar()
+        var n = cuenta
         // En modos comunes: con el menú abierto el bucle corre en modo de seguimiento y la cuenta seguiría parada.
         let t = Timer(timeInterval: 1, repeats: true) { [weak self] t in
             guard let self, s === self.sesion else { t.invalidate(); return }
@@ -606,22 +799,69 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 self.pintar()
             } else {
                 t.invalidate()
-                self.capturar(s, segundos: segundos == 0 ? topeSegundos : segundos)
+                self.capturar(s, segundos: limite)
             }
         }
         RunLoop.main.add(t, forMode: .common)
         s.cuenta = t
     }
 
+    /// Carpeta, calidad, puntero y audio de los Ajustes de la sesión → `Grabador`. Si la carpeta
+    /// elegida no vale, se graba en ~/Movies y se avisa. Con micrófono y el permiso sin pedir, lo pide
+    /// aquí (el diálogo del sistema) y sigue al responder; sin permiso, graba sin micrófono y avisa.
     func capturar(_ s: Sesion, segundos: Double) {
         estado = .iniciando
         pintar()
+        let a = s.ajustes
+        var carpeta = a.carpeta
+        if !a.carpetaEsLaDePorDefecto, let p = problemaCarpeta(carpeta) {
+            let m = "La carpeta \(abreviar(carpeta.path)) \(p): se guarda en ~/Movies."
+            s.avisoCarpeta = m
+            avisar("Aviso: \(m)")
+            notificarAviso("Carpeta de destino no disponible", m)
+            carpeta = Ajustes.carpetaPorDefecto
+            pintar()
+        }
+        // Solo se crea ~/Movies; una carpeta elegida que falte no se crea (sería otro disco sin montar).
+        if carpeta.standardizedFileURL.path == Ajustes.carpetaPorDefecto.standardizedFileURL.path {
+            try? FileManager.default.createDirectory(at: carpeta, withIntermediateDirectories: true)
+        }
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyyMMdd-HHmmss"
-        let carpeta = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Movies")
-        try? FileManager.default.createDirectory(at: carpeta, withIntermediateDirectories: true)
-        let g = Grabador(ruta: carpeta.appendingPathComponent("pantalla-\(f.string(from: Date())).mp4"), limite: segundos)
+        let ruta = carpeta.appendingPathComponent("pantalla-\(f.string(from: Date())).mp4")
+        var peticion = Peticion(fps: a.calidad.fps(pantalla: pantalla.id), bitrate: a.calidad.bitrate,
+                                puntero: a.mostrarPuntero, clics: a.marcarClics && hayMacOS15(), audioSistema: a.audio.sistema)
+        if a.audio.microfono, !hayMacOS15() { avisar("Aviso: el micrófono necesita macOS 15; se graba sin él.") }
+        guard a.audio.microfono, hayMacOS15() else {
+            arrancar(s, ruta: ruta, segundos: segundos, peticion: peticion)
+            return
+        }
+        let sinPermiso = { [self] in
+            let m = "Sin permiso de micrófono: se graba sin él. Actívalo en Ajustes del Sistema > Privacidad y seguridad > Micrófono."
+            avisar("Aviso: \(m)")
+            notificarAviso("Grabación sin micrófono", m)
+        }
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            peticion.microfono = true
+            arrancar(s, ruta: ruta, segundos: segundos, peticion: peticion)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { ok in
+                DispatchQueue.main.async { [self] in
+                    guard s === sesion, !s.cancelado else { return }
+                    if ok { peticion.microfono = true } else { sinPermiso() }
+                    arrancar(s, ruta: ruta, segundos: segundos, peticion: peticion)
+                }
+            }
+        default:
+            sinPermiso()
+            arrancar(s, ruta: ruta, segundos: segundos, peticion: peticion)
+        }
+    }
+
+    func arrancar(_ s: Sesion, ruta: URL, segundos: Double, peticion: Peticion) {
+        let g = Grabador(ruta: ruta, limite: segundos, peticion: peticion)
         s.grabador = g
         g.alEmpezar = { [weak self] in
             guard let self, s === self.sesion, case .iniciando = self.estado else { return }
@@ -741,13 +981,70 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         case .video:
             estado = .hecho
             pintar()
-            notificar(ruta: s.rutaVideo ?? "", medida: s.medida)
+            alTerminar(s)
             if residente { volverAEspera(en: 5) } else { DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [self] in salirDeTerminal(con: 0) } }
         case .fallo:
             estado = .error
             pintar()
             if residente { volverAEspera(en: 15) } else { DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [self] in salirDeTerminal(con: s.codigo) } }
         }
+    }
+
+    /// Lo que piden los Ajustes al acabar bien: notificación (con su sonido), sonido suelto si no hay
+    /// notificación, mostrar en Finder y copiar la ruta.
+    func alTerminar(_ s: Sesion) {
+        let a = s.ajustes
+        let ruta = s.rutaVideo ?? ""
+        let medida = s.avisoCarpeta == nil ? s.medida : "\(s.medida). Guardado en ~/Movies: la carpeta elegida no estaba disponible."
+        if a.notificar {
+            notificar(ruta: ruta, medida: medida, sonido: a.sonido)
+        } else if a.sonido {
+            // El sonido de alerta del sistema, el que haya elegido el usuario.
+            NSSound.beep()
+        }
+        if a.copiarRuta {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(ruta, forType: .string)
+        }
+        if a.abrirEnFinder { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: ruta)]) }
+    }
+
+    // MARK: Ajustes
+
+    /// «Ajustes…» (⌘,): en cualquier estado salvo grabando. Abierta durante una grabación (por el
+    /// atajo, por ejemplo), la ventana deshabilita sus controles hasta que termine.
+    @objc func abrirAjustes() {
+        if case .grabando = estado { NSSound.beep(); return }
+        if ventanaAjustes == nil { ventanaAjustes = VentanaAjustes() }
+        ventanaAjustes?.bloquear(hayCaptura())
+        ventanaAjustes?.mostrar()
+    }
+
+    /// Menú principal de la app. No se ve (es de barra de menús), pero con la ventana de Ajustes
+    /// delante es el que da ⌘, ⌘W, ⌘Q y la edición de texto (⌘C, ⌘V, ⌘A, ⌘Z) en sus campos.
+    func montarMenuPrincipal() {
+        let principal = NSMenu()
+        func submenu(_ titulo: String, _ items: [(String, Selector?, String)]) -> NSMenu {
+            let m = NSMenu(title: titulo)
+            for (t, sel, tecla) in items {
+                if t == "-" { m.addItem(.separator()); continue }
+                m.addItem(withTitle: t, action: sel, keyEquivalent: tecla)
+            }
+            let padre = NSMenuItem(title: titulo, action: nil, keyEquivalent: "")
+            padre.submenu = m
+            principal.addItem(padre)
+            return m
+        }
+        let app = submenu("Grabar pantalla", [("Ajustes…", #selector(abrirAjustes), ","), ("-", nil, ""),
+                                              ("Salir de Grabar pantalla", #selector(salir), "q")])
+        app.autoenablesItems = false
+        for i in app.items where i.action != nil { i.target = self }
+        ajustesPrincipal = app.items.first
+        _ = submenu("Edición", [("Deshacer", Selector(("undo:")), "z"), ("Rehacer", Selector(("redo:")), "Z"), ("-", nil, ""),
+                                ("Cortar", #selector(NSText.cut(_:)), "x"), ("Copiar", #selector(NSText.copy(_:)), "c"),
+                                ("Pegar", #selector(NSText.paste(_:)), "v"), ("Seleccionar todo", #selector(NSText.selectAll(_:)), "a")])
+        _ = submenu("Ventana", [("Cerrar", #selector(NSWindow.performClose(_:)), "w")])
+        NSApp.mainMenu = principal
     }
 
     // MARK: Fotogramas
@@ -848,9 +1145,13 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         func pieResidente() {
             guard residente else { return }
             menu.addItem(.separator())
-            let ajustes = accion("Ajustes…", nil, ",")
-            ajustes.isEnabled = false
+            // Grabando, sin acción: el menú lo deja deshabilitado.
+            var grabando = false
+            if case .grabando = estado { grabando = true }
+            accion("Ajustes…", grabando ? nil : #selector(abrirAjustes), ",")
             accion("Salir", #selector(salir), "q")
+            ajustesPrincipal?.isEnabled = !grabando
+            ventanaAjustes?.bloquear(hayCaptura())
         }
         boton?.imagePosition = .imageLeft
         switch estado {
@@ -891,6 +1192,7 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             boton?.image = simbolo("record.circle.fill", rojo: true)
             boton?.title = tiempo()
             fila("Grabando \(tiempo()) · \(pantalla.nombre)")
+            if let m = sesion?.avisoCarpeta { fila(m) }
             accion("Detener grabación", #selector(detener), residente ? "" : ".", atajo: residente)
             fila("Clic en el icono: detener")
             pieResidente()

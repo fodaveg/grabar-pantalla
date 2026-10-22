@@ -1,8 +1,8 @@
 #!/usr/bin/env zsh
-# Compila main.swift y monta ~/Applications/Grabar pantalla.app (app de barra de menús, LSUIElement)
+# Compila main.swift y ajustes.swift y monta ~/Applications/Grabar pantalla.app (app de barra de menús, LSUIElement)
 # firmada con el certificado «Apple Development» del llavero (ad hoc si no lo hay). La ruta
 # absoluta de ../grabar-pantalla queda en el Info.plist (clave GrabarPantallaScript): la app la usa
-# para encontrar ../fotogramas. Tocar main.swift exige reinstalar. Con el certificado, el permiso de «Grabación de pantalla» sobrevive a las recompilaciones (TCC
+# para encontrar ../fotogramas. Tocar main.swift o ajustes.swift exige reinstalar. Con el certificado, el permiso de «Grabación de pantalla» sobrevive a las recompilaciones (TCC
 # lo ata al identificador y al equipo); con firma ad hoc lo ata al hash y lo vuelve a pedir cada vez.
 set -euo pipefail
 aqui=${0:A:h}
@@ -11,7 +11,7 @@ bundle=~/"Applications/Grabar pantalla.app"
 mkdir -p "$bundle/Contents/MacOS"
 # Compilada para macOS 13 (LSMinimumSystemVersion), no para el sistema de esta máquina: lo nuevo
 # va tras #available y el SDK no avisa de lo que solo está obsoleto en versiones posteriores.
-/usr/bin/swiftc -O -target "$(uname -m)-apple-macos13.0" "$aqui/main.swift" -o "$bundle/Contents/MacOS/grabar-pantalla"
+/usr/bin/swiftc -O -target "$(uname -m)-apple-macos13.0" "$aqui/main.swift" "$aqui/ajustes.swift" -o "$bundle/Contents/MacOS/grabar-pantalla"
 # Icono: se dibuja con código (icono.swift) en cada instalación; no hay PNG en el repo.
 tmp=$(mktemp -d)
 /usr/bin/swiftc -O "$aqui/icono.swift" -o "$tmp/icono"
@@ -34,6 +34,7 @@ cat > "$bundle/Contents/Info.plist" <<EOF
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSScreenCaptureUsageDescription</key><string>Grabar la pantalla en vídeo.</string>
+  <key>NSMicrophoneUsageDescription</key><string>Grabar el micrófono junto a la pantalla, si lo eliges en Ajustes.</string>
   <key>GrabarPantallaScript</key><string>$script</string>
 </dict></plist>
 EOF
