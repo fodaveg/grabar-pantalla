@@ -15,11 +15,17 @@
 # Icono en la barra de menús: si existe ~/Applications/Grabar pantalla.app, este script se
 # reemplaza (exec) por esa app con los mismos argumentos, y la app vuelve a lanzar ESTE script
 # como hijo con GRABAR_PANTALLA_APP=1. Con esa variable el script emite por stdout líneas de
-# protocolo (@estado cuenta N, @estado grabando <pid de ffmpeg>, @estado hecho <ruta>) y la app
-# muestra la cuenta atrás, el tiempo y «Detener grabación» (SIGINT al pid de ffmpeg). Sin la
-# app, el script funciona igual pero sin icono. Desde Spotlight la app arranca sin argumentos y
-# pasa «0» al script (grabar sin límite hasta Detener); desde la terminal este script resuelve
-# el valor por defecto (15) ANTES de hacer exec, así que la app siempre distingue los dos casos.
+# protocolo (@estado cuenta N, @estado grabando <pid de ffmpeg>, @estado medida <texto>,
+# @estado hecho <ruta>) y la app muestra la cuenta atrás, el tiempo y «Detener grabación» (SIGINT
+# al pid de ffmpeg). Sin la app, el script funciona igual pero sin icono.
+# La app tiene dos modos. Desde Spotlight/Finder/open arranca sin argumentos y es RESIDENTE: se
+# queda en la barra de menús en espera (graba al instante si la abren normalmente, no si es un
+# ítem de inicio de sesión), lanza este script una vez por grabación con «0» (hasta Detener), y
+# vuelve a espera al acabar; atajo global ⌃⌥⌘R para empezar/detener. Desde la terminal este script
+# resuelve el valor por defecto (15) ANTES de hacer exec, así que la app recibe argumentos y se
+# comporta como proceso propio de un solo uso (no toca la residente) que sale al terminar.
+# El aviso «Grabación terminada» (fotogramas y fps, con «Mostrar» y «Copiar ruta») lo manda la
+# app; este script solo usa osascript cuando corre sin ella.
 # Detener antes de tiempo (icono o Ctrl-C) cierra el mp4 limpio: ffmpeg sale con código ≠ 0 y se
 # da el vídeo por bueno si el fichero existe y ffprobe lo lee.
 # Nunca quedan procesos huérfanos: al salir la app (Cancelar, ⌘Q, SIGTERM) manda SIGINT a ffmpeg y al
@@ -100,5 +106,9 @@ duracion=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$salida")
 fps=$(printf '%.1f' $(( fotogramas / duracion )))
 echo "Fotogramas: $fotogramas (≈ $fps fps en $(printf '%.1f' $duracion) s)"
 echo "Hecho: $salida"
+estado medida "${fotogramas} fotogramas, ≈ ${fps} fps"
 estado hecho $salida
-osascript -e "display notification \"${fotogramas} fotogramas, ≈ ${fps} fps\" with title \"Grabación terminada\" subtitle \"${salida:t}\" sound name \"Glass\"" || true
+# Bajo la app, la notificación (con «Mostrar» y «Copiar ruta») es suya; sin app, osascript.
+if [[ -z ${GRABAR_PANTALLA_APP:-} ]]; then
+  osascript -e "display notification \"${fotogramas} fotogramas, ≈ ${fps} fps\" with title \"Grabación terminada\" subtitle \"${salida:t}\" sound name \"Glass\"" || true
+fi
