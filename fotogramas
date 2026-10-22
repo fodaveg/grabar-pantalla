@@ -1,0 +1,164 @@
+#!/usr/bin/env zsh
+# Saca fotogramas PNG de un vídeo de grabar-pantalla para que un agente (que lee imágenes, no
+# vídeo) pueda analizarlo. Tres modos:
+#   fotogramas <video> [N]                      N fotogramas repartidos por todo el vídeo (12 por defecto)
+#   fotogramas <video> --hoja [N]               una hoja de contacto: un PNG con N miniaturas y su tiempo
+#   fotogramas <video> --tramo <desde> <hasta>  TODOS los fotogramas entre esos segundos (p. ej. 2.0 3.5),
+#                                               tal como están en el vídeo: sin remuestrear ni duplicar
+# Opciones: --ancho <px> escala a ese ancho (muestreo y hoja: 1600 por defecto, que es lo que mejor
+# leen los agentes; --tramo: tamaño original, porque ahí importa el detalle), --salida <dir> cambia
+# la carpeta (por defecto, junto al vídeo: <nombre>-fotogramas/ o <nombre>-tramo-<desde>-<hasta>/),
+# --forzar permite un --tramo de más de 300 imágenes.
+# Cada PNG se llama t<milisegundos>ms.png con su tiempo de presentación en el vídeo (t002345ms.png),
+# para poder citarlo. Al acabar imprime la carpeta y cuántos PNG; en --tramo, también el intervalo medio
+# y máximo entre fotogramas, que es lo que delata saltos. El vídeo no se toca.
+# La hoja pone el tiempo sobre cada miniatura con ImageMagick (el ffmpeg de Homebrew no trae drawtext);
+# sin ImageMagick o sin una tipografía del sistema sale igual, sin texto.
+set -euo pipefail
+export PATH=$PATH:/opt/homebrew/bin:/usr/local/bin
+# El Mac de David usa coma decimal: awk y printf leerían mal «0.008333».
+export LC_ALL=C
+
+fallo() { print -u2 -r -- "fotogramas: $*"; exit 1; }
+uso() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+modo=muestreo n= desde= hasta= ancho= salida= forzar=0 video=
+args=("$@")
+i=1
+while (( i <= $#args )); do
+  a=${args[i]}
+  case $a in
+    -h|--help) uso ;;
+    --hoja) modo=hoja
+      if [[ ${args[i+1]:-} == <-> ]]; then n=${args[i+1]}; (( ++i )); fi ;;
+    --tramo) modo=tramo
+      [[ -n ${args[i+1]:-} && -n ${args[i+2]:-} ]] || fallo "--tramo pide <desde> <hasta> en segundos"
+      desde=${args[i+1]} hasta=${args[i+2]}; i=$(( i + 2 )) ;;
+    --ancho) ancho=${args[i+1]:-}; [[ $ancho == <-> ]] || fallo "--ancho pide píxeles"; (( ++i )) ;;
+    --salida) salida=${args[i+1]:-}; [[ -n $salida ]] || fallo "--salida pide una carpeta"; (( ++i )) ;;
+    --forzar) forzar=1 ;;
+    -*) fallo "opción desconocida: $a" ;;
+    *) if [[ -z $video ]]; then video=$a
+       elif [[ $a == <-> && -z $n ]]; then n=$a
+       else fallo "argumento sobrante: $a"; fi ;;
+  esac
+  (( ++i ))
+done
+[[ -n $video ]] || uso
+[[ -f $video ]] || fallo "no existe $video"
+command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || fallo "falta ffmpeg (brew install ffmpeg)"
+[[ -z $n ]] && n=12
+(( n >= 1 )) || fallo "N debe ser ≥ 1"
+if [[ $modo == tramo ]]; then
+  num='^[0-9]+(\.[0-9]+)?$'
+  [[ $desde =~ $num && $hasta =~ $num ]] || fallo "desde y hasta son segundos, con decimales si hace falta"
+  (( hasta > desde )) || fallo "hasta debe ser mayor que desde"
+fi
+# Muestreo y hoja: 1600 px por defecto. Tramo: original.
+[[ -z $ancho && $modo != tramo ]] && ancho=1600
+
+video=${video:A}
+base=${video:t:r}
+if [[ -n $salida ]]; then dir=${salida:A}
+elif [[ $modo == tramo ]]; then dir=${video:h}/$base-tramo-$desde-$hasta
+else dir=${video:h}/$base-fotogramas; fi
+mkdir -p "$dir"
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/fotogramas.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+dur=$(ffprobe -v error -select_streams v:0 -show_entries format=duration -of csv=p=0 "$video")
+[[ $dur == <->* ]] || fallo "ffprobe no lee la duración de $video"
+escala=; [[ -n $ancho ]] && escala="scale='min($ancho,iw)':-2:flags=lanczos,"
+
+# Nombre t<ms>ms.png a partir de un tiempo en segundos; si dos caen en el mismo ms, sufijo _2, _3…
+nombre() {
+  local ms=$(printf '%.0f' $(( $1 * 1000 ))) base_ n_=1 f
+  f=$(printf 't%06dms' $ms); base_=$f
+  while [[ -e $dir/$f.png ]]; do (( ++n_ )); f=${base_}_$n_; done
+  print -r -- $f.png
+}
+
+# Mueve los $tmp/f_NNNNNN.png a $dir con el nombre de su pts_time (en el orden de $1, un tiempo por línea).
+renombrar() {
+  local -a ts files; ts=("${(@f)$(<$1)}"); files=($tmp/f_*.png(N))
+  (( ${#ts} == ${#files} )) || fallo "ffmpeg escribió ${#files} PNG y vio ${#ts} fotogramas"
+  local k
+  for k in {1..${#files}}; do mv "$files[k]" "$dir/$(nombre $ts[k])"; done
+}
+
+# Tiempos (pts_time) de los fotogramas que ha pasado ffmpeg, del log de showinfo.
+tiempos() { grep -o 'pts_time:[-0-9.e]*' "$1" | cut -d: -f2; }
+
+case $modo in
+tramo)
+  # Estimación sin decodificar: paquetes de vídeo con pts en el intervalo.
+  est=$(ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 "$video" \
+    | awk -v a=$desde -v b=$hasta '$1+0>=a && $1+0<=b {c++} END {print c+0}')
+  (( est > 0 )) || fallo "no hay fotogramas entre $desde s y $hasta s (el vídeo dura ${dur%%.*}.${${dur#*.}[1,2]} s)"
+  if (( est > 300 && ! forzar )); then
+    fallo "el tramo tiene $est fotogramas (más de 300); acórtalo o añade --forzar"
+  fi
+  pre=$(( desde > 1 ? desde - 1 : 0 ))
+  # -copyts conserva los tiempos del vídeo tras el -ss; select se queda con el intervalo (ambos extremos
+  # incluidos) y passthrough impide que ffmpeg duplique o descarte fotogramas para igualar una tasa.
+  ffmpeg -hide_banner -nostats -loglevel info -ss $pre -copyts -i "$video" \
+    -vf "select='gte(t,$desde)*lte(t,$hasta)',${escala}showinfo" -fps_mode passthrough \
+    "$tmp/f_%06d.png" 2> "$tmp/log" || { tail -5 "$tmp/log" >&2; fallo "ffmpeg falló"; }
+  tiempos "$tmp/log" > "$tmp/ts"
+  renombrar "$tmp/ts"
+  total=$(print -l $dir/t*ms.png | wc -l | tr -d ' ')
+  print -r -- "Carpeta: $dir"
+  print -r -- "PNG: $total (entre $desde s y $hasta s)"
+  sort -g "$tmp/ts" | awk 'NR>1 {d=($1-p)*1000; s+=d; if (d>m) m=d; k++} {p=$1}
+    END { if (k) printf "Intervalo entre fotogramas: medio %.1f ms, máximo %.1f ms (%d intervalos)\n", s/k, m, k
+          else print "Un solo fotograma: no hay intervalos" }'
+  ;;
+muestreo|hoja)
+  # N instantes en el centro de N tramos iguales; para cada uno, el primer fotograma desde ese instante.
+  out=$dir; [[ $modo == hoja ]] && out=$tmp/m && mkdir -p "$out"
+  real=$dir; dir=$out
+  : > "$tmp/ts_all"
+  for k in {0..$(( n - 1 ))}; do
+    t=$(awk -v d=$dur -v k=$k -v n=$n 'BEGIN {printf "%.6f", d*(k+0.5)/n}')
+    ffmpeg -hide_banner -nostats -loglevel info -ss $t -copyts -i "$video" \
+      -vf "${escala}showinfo" -fps_mode passthrough -frames:v 1 "$tmp/f_000001.png" -y 2> "$tmp/log" \
+      || { tail -5 "$tmp/log" >&2; fallo "ffmpeg falló en t=$t"; }
+    [[ -f $tmp/f_000001.png ]] || continue
+    tiempos "$tmp/log" | head -1 > "$tmp/ts"
+    renombrar "$tmp/ts"
+    cat "$tmp/ts" >> "$tmp/ts_all"
+  done
+  dir=$real
+  if [[ $modo == muestreo ]]; then
+    print -r -- "Carpeta: $dir"
+    print -r -- "PNG: $(print -l $dir/t*ms.png | wc -l | tr -d ' ') (repartidos por ${dur%%.*} s de vídeo)"
+  else
+    cols=$(awk -v n=$n 'BEGIN {c=int(sqrt(n)+0.999); print c}')
+    hoja=$dir/hoja.png
+    font=
+    for f in /System/Library/Fonts/Helvetica.ttc /System/Library/Fonts/Supplemental/Arial.ttf \
+             /usr/share/fonts/**/DejaVuSans.ttf(N[1]); do [[ -f $f ]] && { font=$f; break; }; done
+    # Con ImageMagick y una tipografía, el tiempo va sobre cada miniatura; si no, tile de ffmpeg sin texto.
+    if command -v magick >/dev/null && [[ -n $font ]]; then
+      miniatura=$(( ancho / cols ))
+      # Etiqueta «t=SS.mmm s» a partir del nombre en ms.
+      labels=()
+      for p in $tmp/m/t*ms.png; do
+        ms=${${p:t}[2,7]}; ms=$(( 10#$ms ))
+        labels+=(-label "$(printf '%d.%03d s' $(( ms / 1000 )) $(( ms % 1000 )))" "$p")
+      done
+      magick montage -font "$font" -pointsize $(( miniatura / 14 + 8 )) -fill white -background '#222' \
+        -geometry ${miniatura}x+4+4 -tile ${cols}x "${labels[@]}" "$hoja"
+      print -r -- "Tiempos sobre las miniaturas: sí (ImageMagick)"
+    else
+      miniatura=$(( ancho / cols ))
+      ffmpeg -hide_banner -nostats -loglevel error -y -pattern_type glob -framerate 1 -i "$tmp/m/t*ms.png" \
+        -vf "scale=${miniatura}:-2,tile=${cols}x$(( (n + cols - 1) / cols )):padding=4" -frames:v 1 "$hoja"
+      print -r -- "Tiempos sobre las miniaturas: no (sin ImageMagick ni tipografía); ver la lista:"
+      for p in $tmp/m/t*ms.png; do print -r -- "  ${p:t}"; done
+    fi
+    print -r -- "Carpeta: $dir"
+    print -r -- "Hoja: $hoja ($n miniaturas, $cols columnas, ancho ${ancho}px)"
+  fi
+  ;;
+esac

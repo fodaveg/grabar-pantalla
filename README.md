@@ -44,8 +44,27 @@ dónde activarlo.
 Para forzar una pantalla: `GRABAR_PANTALLA_INDICE=1 grabar-pantalla 10`. El número es el de
 `Capture screen N` en `ffmpeg -f avfoundation -list_devices true -i ""`.
 
+## Fotogramas para agentes
+
+Un agente lee imágenes, no vídeo. `fotogramas` saca PNG de una grabación, con el tiempo en el
+nombre (`t002345ms.png`) para poder citarlos:
+
+| Comando | Qué saca |
+|---|---|
+| `fotogramas video.mp4 [N]` | N fotogramas repartidos por todo el vídeo (12 por defecto) |
+| `fotogramas video.mp4 --hoja [N]` | un solo PNG, `hoja.png`, con N miniaturas y su tiempo |
+| `fotogramas video.mp4 --tramo 2.0 3.5` | TODOS los fotogramas entre esos segundos, sin saltarse ni duplicar ninguno |
+
+La carpeta sale junto al vídeo (`<nombre>-fotogramas/` o `<nombre>-tramo-<desde>-<hasta>/`) o donde
+diga `--salida <dir>`. Con `--tramo` imprime también el intervalo medio y máximo entre fotogramas
+en ms: un máximo muy por encima del medio delata saltos en la grabación. Más de 300 imágenes en un
+tramo exigen `--forzar`. `--ancho <px>` escala; sin él, el muestreo y la hoja salen a 1600 px y
+`--tramo` a tamaño original. El tiempo sobre las miniaturas de la hoja usa ImageMagick
+(`brew install imagemagick`); sin él, la hoja sale sin texto.
+
 ## Cómo está hecho
 
+- `fotogramas`: script de zsh que saca los PNG con ffmpeg (el vídeo no se toca).
 - `grabar-pantalla`: script de zsh con toda la lógica de grabación. Si la app está instalada, se
   relanza a través de ella para que salga el icono.
 - `app/main.swift`: la app de la barra de menús. Lanza el script como hijo y lee de su salida
