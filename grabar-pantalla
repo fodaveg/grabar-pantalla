@@ -1,0 +1,104 @@
+#!/usr/bin/env zsh
+# Versión del Mac de grabar-pantalla (la de Fedora usa kmsgrab y VAAPI, que aquí no existen).
+# Graba una pantalla con ffmpeg (avfoundation) a 120 capturas/s pedidas (medido: el Mac entrega como mucho una cada 11,2 ms, ≈ 90 fps), con el puntero y los
+# clics marcados, y codifica en H.264 por hardware (VideoToolbox).
+# Uso: grabar-pantalla [segundos]   (por defecto 15; 0 = sin límite hasta Detener, con tope de seguridad de 30 min)
+# Qué pantalla: la que indique GRABAR_PANTALLA_INDICE (N de «Capture screen N» de avfoundation; 0 = la
+# principal de Ajustes > Pantallas, no necesariamente la integrada; ffmpeg -f avfoundation -list_devices
+# true -i "" las lista). Sin la variable, la app del icono pone la pantalla donde está el puntero al
+# arrancar (lo mismo desde Spotlight que desde la terminal) y sin app se usa la 0. Forzarla a mano:
+# GRABAR_PANTALLA_INDICE=1 grabar-pantalla 10
+# Deja el vídeo en ~/Movies/pantalla-AAAAMMDD-HHMMSS.mp4. No pide sudo; la primera vez macOS
+# pide permiso de «Grabación de pantalla» para la terminal (o para «Grabar pantalla» si se lanza
+# desde Spotlight; si la app quedó con firma ad hoc, lo vuelve a pedir tras cada recompilación).
+#
+# Icono en la barra de menús: si existe ~/Applications/Grabar pantalla.app, este script se
+# reemplaza (exec) por esa app con los mismos argumentos, y la app vuelve a lanzar ESTE script
+# como hijo con GRABAR_PANTALLA_APP=1. Con esa variable el script emite por stdout líneas de
+# protocolo (@estado cuenta N, @estado grabando <pid de ffmpeg>, @estado hecho <ruta>) y la app
+# muestra la cuenta atrás, el tiempo y «Detener grabación» (SIGINT al pid de ffmpeg). Sin la
+# app, el script funciona igual pero sin icono. Desde Spotlight la app arranca sin argumentos y
+# pasa «0» al script (grabar sin límite hasta Detener); desde la terminal este script resuelve
+# el valor por defecto (15) ANTES de hacer exec, así que la app siempre distingue los dos casos.
+# Detener antes de tiempo (icono o Ctrl-C) cierra el mp4 limpio: ffmpeg sale con código ≠ 0 y se
+# da el vídeo por bueno si el fichero existe y ffprobe lo lee.
+# Nunca quedan procesos huérfanos: al salir la app (Cancelar, ⌘Q, SIGTERM) manda SIGINT a ffmpeg y al
+# script, espera 5 s y mata lo que siga vivo; si la app muere de golpe, un vigilante del script lo
+# detecta y detiene ffmpeg. Si ffmpeg no crea el vídeo en 10 s (típico: sin permiso de «Grabación de
+# pantalla», que deja a ffmpeg colgado sin error) el script lo mata y sale con un mensaje de error.
+# Instalar o reinstalar la app (tras tocar su código): app/instalar.sh
+set -euo pipefail
+# Lanzada desde LaunchServices el PATH es el mínimo y no incluye Homebrew (ffmpeg, ffprobe).
+export PATH=$PATH:/opt/homebrew/bin:/usr/local/bin
+app=~/"Applications/Grabar pantalla.app/Contents/MacOS/grabar-pantalla"
+if [[ -z ${GRABAR_PANTALLA_APP:-} && -x $app ]]; then
+  exec "$app" "${1:-15}"
+fi
+segundos=${1:-15}
+indice=${GRABAR_PANTALLA_INDICE:-0}
+# Líneas de protocolo para la app; fuera de ella no se imprime nada.
+estado() { if [[ -n ${GRABAR_PANTALLA_APP:-} ]]; then print -r -- "@estado $*"; fi; }
+tope=$segundos
+(( segundos == 0 )) && tope=1800
+mkdir -p ~/Movies
+salida=~/Movies/pantalla-$(date +%Y%m%d-%H%M%S).mp4
+if (( segundos == 0 )); then
+  echo "Grabando hasta Detener (máx. 30 min) en 3 s…"
+else
+  echo "Grabando ${segundos} s en 3 s…"
+fi
+# Modo app: si la app desaparece (SIGKILL, cierre brusco) este script y ffmpeg no se quedan huérfanos.
+# El vigilante, en segundo plano, manda SIGTERM a este script (que lo traslada a ffmpeg, abajo).
+if [[ -n ${GRABAR_PANTALLA_APP:-} ]]; then
+  padre=$PPID yo=$$
+  ( while kill -0 $padre 2>/dev/null; do sleep 1; done; kill -TERM $yo 2>/dev/null ) >/dev/null 2>&1 &
+  vigilante=$!
+fi
+for n in 3 2 1; do estado cuenta $n; sleep 1; done
+echo "GRABANDO"
+# nv12 en la captura: es lo que come VideoToolbox sin convertir en la CPU (con la conversión, ~80 fps).
+# En segundo plano (-nostdin, &) para poder reenviarle SIGINT: así cierra el mp4 limpio.
+ffmpeg -nostdin -hide_banner -loglevel error -y -f avfoundation -capture_cursor 1 -capture_mouse_clicks 1 \
+  -pixel_format nv12 -framerate 120 -i "Capture screen $indice:none" \
+  -t "$tope" -c:v h264_videotoolbox -b:v 40M "$salida" 2> >(grep -v 'NSKVONotifying_AVCaptureScreenInput' >&2) &
+pid=$!
+estado iniciando $pid
+# Ctrl-C: se lo pasamos a ffmpeg y seguimos esperando a que cierre el fichero. SIGTERM (la app se
+# cierra o desaparece): lo mismo, y si a los 5 s ffmpeg sigue vivo (SIGINT no basta con una captura
+# colgada, medido) se le manda SIGKILL.
+trap 'kill -INT $pid 2>/dev/null || true' INT
+trap 'kill -INT $pid 2>/dev/null || true; ( sleep 5; kill -KILL $pid 2>/dev/null ) >/dev/null 2>&1 &' TERM
+# Con permiso de pantalla denegado ffmpeg se queda colgado sin crear el mp4. En una captura sana
+# el fichero existe a los ~0,5 s y ya tiene bytes a los ~0,6-0,8 s (medido, 3 pruebas): si a los
+# 10 s no hay bytes, la captura no arranca.
+for (( i = 0; i < 100; i++ )); do
+  [[ -s $salida ]] && break
+  kill -0 $pid 2>/dev/null || break
+  sleep 0.1
+done
+if kill -0 $pid 2>/dev/null && [[ ! -s $salida ]]; then
+  kill -INT $pid 2>/dev/null || true
+  for (( i = 0; i < 20; i++ )); do kill -0 $pid 2>/dev/null || break; sleep 0.1; done
+  kill -KILL $pid 2>/dev/null || true
+  rm -f "$salida"
+  echo "La captura no arranca. Revisa Ajustes del Sistema > Privacidad y seguridad > Grabación de pantalla y audio del sistema: «Grabar pantalla» debe estar activado" >&2
+  [[ -n ${vigilante:-} ]] && kill $vigilante 2>/dev/null
+  exit 1
+fi
+kill -0 $pid 2>/dev/null && estado grabando $pid
+while kill -0 $pid 2>/dev/null; do wait $pid || true; done
+trap - INT TERM
+[[ -n ${vigilante:-} ]] && kill $vigilante 2>/dev/null
+# ffmpeg sale con código ≠ 0 tras SIGINT aunque el vídeo esté bien: manda que ffprobe lo lea.
+if [[ ! -s $salida ]] || ! ffprobe -v error -show_entries format=duration -of csv=p=0 "$salida" >/dev/null 2>&1; then
+  echo "No se generó un vídeo válido: $salida" >&2
+  exit 1
+fi
+fotogramas=$(ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$salida")
+# fps sobre la duración real del vídeo, no sobre los segundos pedidos (con Detener no coinciden).
+duracion=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$salida")
+fps=$(printf '%.1f' $(( fotogramas / duracion )))
+echo "Fotogramas: $fotogramas (≈ $fps fps en $(printf '%.1f' $duracion) s)"
+echo "Hecho: $salida"
+estado hecho $salida
+osascript -e "display notification \"${fotogramas} fotogramas, ≈ ${fps} fps\" with title \"Grabación terminada\" subtitle \"${salida:t}\" sound name \"Glass\"" || true
