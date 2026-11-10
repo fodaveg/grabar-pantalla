@@ -1118,14 +1118,45 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         return s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, s % 3600 / 60, s % 60) : String(format: "%d:%02d", s / 60, s % 60)
     }
 
-    func simbolo(_ nombre: String, rojo: Bool = false) -> NSImage? {
-        guard var img = NSImage(systemSymbolName: nombre, accessibilityDescription: "Grabar pantalla") else { return nil }
-        if rojo, let c = img.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [.systemRed])) {
-            img = c
-            img.isTemplate = false
-        } else {
-            img.isTemplate = true
+    func simbolo(_ nombre: String) -> NSImage? {
+        let img = NSImage(systemSymbolName: nombre, accessibilityDescription: "Grabar pantalla")
+        img?.isTemplate = true
+        return img
+    }
+
+    /// Icono propio de la barra: una circunferencia y, dentro y con el mismo centro exacto del
+    /// lienzo, un punto relleno o un ✓ (record.circle, a tamaño de barra en una pantalla 1x,
+    /// descentra el punto; checkmark.circle trae otra circunferencia). Sin `rojo` es plantilla y
+    /// macOS lo tiñe; con `rojo` el punto va en rojo y la circunferencia en labelColor, que se
+    /// resuelve al dibujar con la apariencia de la barra.
+    func iconoGrabar(rojo: Bool = false, hecho: Bool = false) -> NSImage {
+        let lado: CGFloat = 16, grosor: CGFloat = 1.5, radioPunto: CGFloat = 3.5
+        let img = NSImage(size: NSSize(width: lado, height: lado), flipped: false) { r in
+            let c = NSPoint(x: r.midX, y: r.midY)
+            let radio = lado / 2 - grosor / 2 - 0.5
+            let aro = NSBezierPath(ovalIn: NSRect(x: c.x - radio, y: c.y - radio, width: radio * 2, height: radio * 2))
+            aro.lineWidth = grosor
+            (rojo ? NSColor.labelColor : .black).setStroke()
+            aro.stroke()
+            if hecho {
+                // ✓ dentro de la caja del punto (7 x 7 pt), con el mismo trazo que la circunferencia.
+                let v = NSBezierPath()
+                v.move(to: NSPoint(x: c.x - 3.25, y: c.y + 0.25))
+                v.line(to: NSPoint(x: c.x - 1, y: c.y - 2.25))
+                v.line(to: NSPoint(x: c.x + 3.25, y: c.y + 2.5))
+                v.lineWidth = grosor
+                v.lineCapStyle = .round
+                v.lineJoinStyle = .round
+                NSColor.black.setStroke()
+                v.stroke()
+            } else {
+                (rojo ? NSColor.systemRed : .black).setFill()
+                NSBezierPath(ovalIn: NSRect(x: c.x - radioPunto, y: c.y - radioPunto, width: radioPunto * 2, height: radioPunto * 2)).fill()
+            }
+            return true
         }
+        img.isTemplate = !rojo
+        img.accessibilityDescription = "Grabar pantalla"
         return img
     }
 
@@ -1158,7 +1189,7 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         boton?.imagePosition = .imageLeft
         switch estado {
         case .espera:
-            boton?.image = simbolo("record.circle")
+            boton?.image = iconoGrabar()
             boton?.title = ""
             accion("Grabar", #selector(grabarPunteroDesdeMenu), atajo: true)
             let sub = NSMenu()
@@ -1191,7 +1222,7 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             fila("Clic en el icono: cancelar")
             pieResidente()
         case .grabando:
-            boton?.image = simbolo("record.circle.fill", rojo: true)
+            boton?.image = iconoGrabar(rojo: true)
             boton?.title = tiempo()
             fila("Grabando \(tiempo()) · \(pantalla.nombre)")
             if let m = sesion?.avisoCarpeta { fila(m) }
@@ -1199,12 +1230,12 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             fila("Clic en el icono: detener")
             pieResidente()
         case .guardando:
-            boton?.image = simbolo("record.circle")
+            boton?.image = iconoGrabar()
             boton?.title = "Guardando…"
             fila("Guardando…")
             pieResidente()
         case .hecho:
-            boton?.image = simbolo("checkmark.circle")
+            boton?.image = iconoGrabar(hecho: true)
             boton?.title = ""
             accion("Mostrar en Finder", #selector(mostrarEnFinder))
             fotogramas("Sacar fotogramas")

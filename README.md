@@ -8,8 +8,9 @@ desde Spotlight o desde la terminal.
   MacBook Pro con una animación a 120 Hz y la calidad «Animaciones»: de 86 a 101 fps en la
   pantalla integrada (con ffmpeg y avfoundation eran 70-76) y los 75 de una externa a 75 Hz.
 - Graba la pantalla donde está el puntero al arrancar.
-- App residente en la barra de menús: en espera (circunferencia con un punto, gris), cuenta atrás, punto rojo con el
-  tiempo, «Guardando…», ✓ al acabar (y de vuelta a espera) y ⚠ si la captura no arranca.
+- App residente en la barra de menús, con un icono propio (una circunferencia con algo dentro):
+  en espera un punto, cuenta atrás, punto rojo con el tiempo, «Guardando…», ✓ al acabar (y de
+  vuelta a espera) y ⚠ si la captura no arranca.
 - Clic izquierdo en el icono: detiene si graba (cancela en la cuenta atrás) y abre el menú en
   espera. Clic derecho o Control + clic: abren el menú siempre.
 - Atajo global ⌃⌥⌘R para empezar y detener.
