@@ -1158,7 +1158,7 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         boton?.imagePosition = .imageLeft
         switch estado {
         case .espera:
-            boton?.image = simbolo("display")
+            boton?.image = simbolo("record.circle")
             boton?.title = ""
             accion("Grabar", #selector(grabarPunteroDesdeMenu), atajo: true)
             let sub = NSMenu()
