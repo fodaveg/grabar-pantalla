@@ -69,8 +69,8 @@ pantalla), «Ajustes…» (⌘,) y «Salir». El atajo global ⌃⌥⌘R empieza
 app, sin permiso de Accesibilidad.
 
 Al terminar, una notificación con el número de fotogramas y los fps ofrece «Mostrar» (Finder; es
-también lo que hace pulsarla) y «Copiar ruta». Los Ajustes la quitan, quitan su sonido o añaden
-mostrar el vídeo en Finder y copiar su ruta al momento.
+también lo que hace pulsarla) y «Copiar ruta», y la ruta del vídeo ya queda en el portapapeles. Los
+Ajustes quitan la notificación, su sonido o la copia, y añaden mostrar el vídeo en Finder.
 
 «Sacar fotogramas» (en el menú del ✓, y en espera para la última grabación) pasa el vídeo por
 [`fotogramas`](#fotogramas-para-agentes) con el muestreo por defecto y abre la carpeta en Finder.
@@ -100,7 +100,7 @@ preferencias de la app y vale desde la siguiente grabación, también la de la t
 | Duración | Hasta Detener | O N segundos, de 1 a 1800. Vale para el menú, el icono y el atajo; la terminal sigue con su argumento. El tope de 30 min no se ajusta. |
 | Puntero | Mostrar, marcar clics | Cada uno por separado. Marcar los clics necesita macOS 15. |
 | Audio | Ninguno | Sonido del sistema (todo el Mac salvo esta app), micrófono (el de por defecto; macOS 15), o los dos. |
-| Al terminar | Notificación y sonido | Además, mostrar el vídeo en Finder y copiar su ruta. Sin notificación, el sonido es el de alerta del sistema. |
+| Al terminar | Notificación, sonido y copiar la ruta | Además, mostrar el vídeo en Finder. Sin notificación, el sonido es el de alerta del sistema. |
 | Abrir al iniciar sesión | No | Con `SMAppService`; la ventana enseña lo que diga macOS, también «pendiente de tu aprobación», con un botón a Ajustes del Sistema. |
 
 El atajo ⌃⌥⌘R aparece en la ventana como información; no se cambia.

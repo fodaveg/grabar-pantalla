@@ -66,7 +66,7 @@ struct Ajustes {
     var notificar = true
     var sonido = true
     var abrirEnFinder = false
-    var copiarRuta = false
+    var copiarRuta = true
 
     /// Lee los ajustes. Un valor fuera de rango (escrito a mano con `defaults`) se ajusta al límite y
     /// uno ilegible vale lo de por defecto.
