@@ -152,7 +152,8 @@ Vive solo en la app residente; la terminal no tiene comando para esto.
 otro proceso ya tenga la combinación no hace fallar el registro: medido en macOS 27).
 - Una grabación normal (menú, atajo, Spotlight, región o ventana) con la memoria encendida la pone
   en pausa: su captura para antes de que arranque la de la grabación, y vuelve al acabar esa
-  grabación. Lo guardado después salta del antes al después de la grabación, sin hueco negro.
+  grabación (bien, con error o cancelada) cuando la captura de la grabación ya ha parado: nunca
+  hay dos capturas de la app a la vez. Lo guardado después salta del antes al después de la grabación, sin hueco negro.
 - El N de los Ajustes vale la próxima vez que se encienda.
 - Apagarla o salir de la app (⌘Q, «Salir», SIGTERM) borra lo grabado. Una app muerta de golpe
   deja sus segmentos, y se borran la próxima vez que se enciende la memoria.
@@ -316,6 +317,7 @@ app=~/"Applications/Grabar pantalla.app/Contents/MacOS/grabar-pantalla"
 GRABAR_PANTALLA_INDICE=0 GRABAR_PANTALLA_PRUEBA_MEMORIA=40,30 "$app"           # 40 s encendida, N = 30
 GRABAR_PANTALLA_PRUEBA_MEMORIA=40,30,10+5 "$app"                              # y a los 10 s, una grabación normal de 5 s
 GRABAR_PANTALLA_PRUEBA_MEMORIA=14,10,5+3 "$app" -cuentaAtras 0                # igual, sin cuenta atrás
+GRABAR_PANTALLA_PRUEBA_MEMORIA=12,10,5+c "$app" -notificar 0 -copiarRuta 0    # la grabación se cancela a 1 s
 ```
 
 Con `SEGUNDOS,N` enciende la memoria con ese N (de 5 a 120), espera esos segundos, guarda por el
@@ -323,7 +325,10 @@ mismo camino que ⌃⌥⌘S (notificación y portapapeles incluidos, según los 
 `Hecho: <ruta>`, los segmentos antes y después de apagarla y los instantes de las uniones entre
 segmentos en el vídeo, vuelve a encenderla 3 s y sale por el camino de ⌘Q (la carpeta de segmentos,
 con el pid, se mira desde fuera cuando el proceso ha terminado). Con `,DESDE+DURANTE` hace además
-una grabación normal (`Hecho: <ruta>` también) a los DESDE s, que pone la memoria en pausa. No lee
+una grabación normal (`Hecho: <ruta>` también) a los DESDE s, que pone la memoria en pausa; con
+`,DESDE+c`, esa grabación se cancela 1 s después de empezar. Imprime «Grabación: stream parado»
+cuando ScreenCaptureKit confirma la parada de la grabación, y «Memoria: volviendo» y «Memoria: de
+vuelta» cuando la memoria pide su captura y cuando ya corre. No lee
 argumentos de grabación; sí `-clave valor` de los Ajustes para ese proceso, como `-cuentaAtras 0`.
 `GRABAR_PANTALLA_INDICE` elige la pantalla como en la terminal. Sale con 0 si guardó un vídeo, con
 1 si no y con 2 si la variable está mal escrita.

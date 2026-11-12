@@ -26,12 +26,15 @@ import ScreenCaptureKit
 
 /// Lo que pide `GRABAR_PANTALLA_PRUEBA_MEMORIA="S,N[,DESDE+DURANTE]"` (README, para desarrolladores):
 /// encender la memoria con N s, guardar a los S s de encendida, apagar y salir. Con DESDE+DURANTE,
-/// además, una grabación normal de DURANTE s a los DESDE s, para probar la pausa en el mismo proceso.
+/// además, una grabación normal de DURANTE s a los DESDE s, para probar la pausa en el mismo proceso;
+/// con DESDE+c, esa grabación se cancela 1 s después de empezar (en la cuenta atrás, si la hay).
 /// Una variable mal escrita sale con 2 sin hacer nada.
 struct PruebaMemoria {
     var encendida: Double
     var segundos: Int
     var grabar: (desde: Double, durante: Double)?
+    /// La grabación de `grabar` se cancela a 1 s de empezar (DESDE+c).
+    var cancelar = false
 }
 
 let pruebaMemoria: PruebaMemoria? = {
@@ -42,12 +45,22 @@ let pruebaMemoria: PruebaMemoria? = {
        (Ajustes.memoriaMinima...Ajustes.memoriaMaxima).contains(n) {
         p = PruebaMemoria(encendida: s, segundos: n)
         if partes.count == 3 {
-            let g = partes[2].split(separator: "+").compactMap { Double($0) }
-            if g.count == 2, g[0] >= 0, g[1] > 0, g[0] < s { p?.grabar = (g[0], g[1]) } else { p = nil }
+            let t = partes[2].split(separator: "+").map(String.init)
+            let cancelar = t.count == 2 && t[1] == "c"
+            let g = t.compactMap { Double($0) }
+            if cancelar, g.count == 1, g[0] >= 0, g[0] < s {
+                // La duración no llega a contar: se cancela antes.
+                p?.grabar = (g[0], 5)
+                p?.cancelar = true
+            } else if g.count == 2, g[0] >= 0, g[1] > 0, g[0] < s {
+                p?.grabar = (g[0], g[1])
+            } else {
+                p = nil
+            }
         }
     }
     guard let p else {
-        avisar("GRABAR_PANTALLA_PRUEBA_MEMORIA=\"SEGUNDOS,N[,DESDE+DURANTE]\" (N de \(Ajustes.memoriaMinima) a \(Ajustes.memoriaMaxima)), no «\(v)»")
+        avisar("GRABAR_PANTALLA_PRUEBA_MEMORIA=\"SEGUNDOS,N[,DESDE+DURANTE|DESDE+c]\" (N de \(Ajustes.memoriaMinima) a \(Ajustes.memoriaMaxima)), no «\(v)»")
         exit(2)
     }
     return p

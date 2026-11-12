@@ -208,6 +208,12 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
     var alEmpezar: () -> Void = {}
     /// Se llama una sola vez, con el mp4 ya cerrado (o borrado si no vale).
     var alAcabar: (Final) -> Void = { _ in }
+    /// Hilo principal: esperan a que el stream esté parado de verdad (`cuandoPare`).
+    private var esperandoParada: [() -> Void] = []
+    /// El stream ya paró (terminó `stopCapture`) o no llegó a existir. Solo en el hilo principal.
+    private var streamParado = false
+    /// Se llamó a `arrancar` (hilo principal). Sin eso no hay stream que esperar.
+    private var arrancado = false
 
     private let cola = DispatchQueue(label: "net.fodaveg.grabar-pantalla.captura", qos: .userInteractive)
     private var stream: SCStream?
@@ -241,6 +247,7 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Pide el contenido compartible, monta filtro, stream y escritor, y arranca. Sin permiso de
     /// Grabación de pantalla falla al momento (sin esperar a que llegue imagen).
     func arrancar(pantalla id: CGDirectDisplayID) {
+        arrancado = true
         // Sin permiso, ScreenCaptureKit falla igual, pero esto no espera al servidor de ventanas.
         // La petición enseña el diálogo del sistema la primera vez y registra la app en la lista
         // de Ajustes; las siguientes no hace nada.
@@ -442,7 +449,7 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
         guard !cerrado else { return }
         cerrado = true
         retenido = nil
-        stream?.stopCapture { _ in }
+        pararStream()
         escritor?.cancelWriting()
         try? FileManager.default.removeItem(at: ruta)
         acabar(.cancelado)
@@ -453,7 +460,7 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
         guard !cerrado else { return }
         cerrado = true
         retenido = nil
-        stream?.stopCapture { _ in }
+        pararStream()
         escritor?.cancelWriting()
         try? FileManager.default.removeItem(at: ruta)
         acabar(.fallo(mensaje))
@@ -482,7 +489,7 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
     private func finalizar(hasta fin: CMTime) {
         guard !cerrado, let escritor, let entrada, let primero else { return }
         cerrado = true
-        stream?.stopCapture { _ in }
+        pararStream()
         if let r = retenido {
             retenido = nil
             // El último no se tira por un codificador ocupado: se le da medio segundo.
@@ -515,6 +522,35 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func acabar(_ f: Final) { DispatchQueue.main.async { [self] in alAcabar(f) } }
+
+    /// Para el stream (en `cola`) y avisa a `cuandoPare` cuando ScreenCaptureKit termina de pararlo
+    /// (completion de `stopCapture`), o al momento si no llegó a crearse. Si la completion no llega
+    /// en 3 s, avisa igual por stderr y da el stream por parado: la memoria no se queda sin volver.
+    private func pararStream() {
+        guard let s = stream else { DispatchQueue.main.async { [self] in marcarParado() }; return }
+        stream = nil
+        s.stopCapture { [self] _ in DispatchQueue.main.async { [self] in marcarParado() } }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [self] in
+            guard !streamParado else { return }
+            avisar("Aviso: ScreenCaptureKit no confirmó la parada de la captura en 3 s")
+            marcarParado()
+        }
+    }
+
+    private func marcarParado() {
+        guard !streamParado else { return }
+        streamParado = true
+        if pruebaMemoria != nil { decir("Grabación: stream parado") }
+        let hacer = esperandoParada
+        esperandoParada = []
+        for f in hacer { f() }
+    }
+
+    /// `f`, en el hilo principal, en cuanto el stream de esta grabación esté parado de verdad (ya,
+    /// si lo está). Lo usa la memoria para no volver con el stream de la grabación aún vivo.
+    func cuandoPare(_ f: @escaping () -> Void) {
+        if streamParado || !arrancado { f() } else { esperandoParada.append(f) }
+    }
 
     /// Entrada AAC a 48 kHz. El escritor convierte lo que llegue (PCM de ScreenCaptureKit, con sus
     /// canales y frecuencia) a esto.
@@ -1260,7 +1296,14 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// La grabación acabó (mp4 cerrado, o nada): hecho, error o cancelación.
     func terminar(_ s: Sesion, _ final: Grabador.Final, codigo: Int32 = 1) {
         guard s === sesion else { return }
-        reanudarMemoria()
+        // La memoria vuelve cuando el stream de esta grabación esté parado de verdad (nunca dos
+        // SCStream de la app a la vez); sin grabador (cancelada en la cuenta atrás), al momento.
+        // Saliendo de la app no vuelve. En diferido: `terminar` cambia antes el estado, y
+        // `reanudarMemoria` no vuelve con una captura en curso.
+        if s.alCerrar == nil {
+            let volver = { [weak self] in DispatchQueue.main.async { self?.reanudarMemoria() } }
+            if let g = s.grabador { g.cuandoPare(volver) } else { volver() }
+        }
         temporizador?.invalidate()
         s.cuenta?.invalidate()
         marco?.cerrar()
@@ -1387,10 +1430,12 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
-    /// Al acabar la grabación normal (bien, mal o cancelada): la memoria vuelve.
+    /// Al acabar la grabación normal (bien, mal o cancelada) y con su stream ya parado: la memoria
+    /// vuelve. Si mientras tanto ha empezado otra grabación, sigue en pausa: volverá al acabar esa.
     func reanudarMemoria() {
-        guard memoriaEnPausa, let m = memoria else { return }
+        guard memoriaEnPausa, let m = memoria, !hayCaptura() else { return }
         memoriaEnPausa = false
+        decir("Memoria: volviendo")
         m.arrancar { [weak self, weak m] error in
             guard let self, let m, self.memoria === m else { return }
             if let error { self.apagarMemoria(aviso: "La memoria no pudo volver tras la grabación: \(error)"); return }
@@ -1468,6 +1513,12 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
                     decir("Prueba: grabación normal de \(formato(g.durante)) s con la memoria encendida")
                     duracionPedida = g.durante
                     empezar()
+                    if p.cancelar {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [self] in
+                            decir("Prueba: cancelar la grabación")
+                            cancelar()
+                        }
+                    }
                 }
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + p.encendida) { [self] in
