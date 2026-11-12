@@ -9,9 +9,13 @@
 //   sesión): se queda en la barra de menús en espera y graba una vez por petición, hasta Detener
 //   (tope de 30 min) o los segundos de los Ajustes. Abierta normalmente graba al instante; como
 //   ítem de inicio de sesión queda en espera. Registra el atajo global y tiene la ventana de Ajustes.
-// - Terminal (con argumentos, que pone el script `grabar-pantalla [segundos]` al hacer exec):
-//   proceso propio de un solo uso. Graba, imprime el resultado y sale con 0 si hay vídeo válido.
-//   No toca la residente, pero lee los mismos Ajustes (salvo la duración, que es su argumento).
+// - Terminal (con argumentos, que pone el script `grabar-pantalla [--region X,Y,ANCHO,ALTO]
+//   [segundos]` al hacer exec): proceso propio de un solo uso. Graba, imprime el resultado y sale
+//   con 0 si hay vídeo válido. No toca la residente, pero lee los mismos Ajustes (salvo la
+//   duración, que es su argumento).
+//
+// Qué se graba de la pantalla (entera o una región) es un `Destino`; el selector de región y el
+// marco que la señala están en region.swift.
 //
 // Los Ajustes (UserDefaults y ventana) están en ajustes.swift; se leen al empezar cada grabación.
 import AppKit
@@ -154,8 +158,21 @@ signal(SIGHUP, alSenal)
 
 // MARK: - Captura
 
+/// Qué se graba. Pantalla y región comparten filtro (la pantalla sin las ventanas de la app) y
+/// difieren en el rectángulo y el tamaño del vídeo (`Grabador.medidas`). Un destino nuevo (una
+/// ventana) es un caso más aquí, en el filtro de `Grabador.arrancar`, en `medidas` y en
+/// `Controlador.queSeGraba`.
+enum Destino {
+    /// La pantalla entera, a su resolución nativa.
+    case pantalla
+    /// Un rectángulo de la pantalla en puntos, relativo a su esquina superior izquierda (como
+    /// `sourceRect` de ScreenCaptureKit y `--region` de la terminal).
+    case region(CGRect)
+}
+
 /// Lo que pide una grabación a la captura, sacado de los Ajustes al empezar.
 struct Peticion {
+    var destino = Destino.pantalla
     var fps: Int32
     var bitrate: Int
     var puntero = true
@@ -237,18 +254,39 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
                 // terminal conviven y ninguna de las dos debe salir.
                 let yo = Bundle.main.bundleIdentifier
                 let propia = contenido.applications.filter { $0.processID == getpid() || (yo != nil && $0.bundleIdentifier == yo) }
-                let filtro = SCContentFilter(display: pantalla, excludingApplications: propia, exceptingWindows: [])
+                // Pantalla y región: la pantalla entera sin la app (también el marco de la región,
+                // que es una ventana suya); la región la recorta `sourceRect` en `montar`.
+                let filtro: SCContentFilter
+                switch peticion.destino {
+                case .pantalla, .region:
+                    filtro = SCContentFilter(display: pantalla, excludingApplications: propia, exceptingWindows: [])
+                }
                 montar(filtro: filtro, id: id, puntos: (pantalla.width, pantalla.height))
             }
         }
     }
 
+    /// Tamaño del vídeo en píxeles y, en una región, el rectángulo de la pantalla que se graba (en
+    /// puntos). Siempre a la resolución nativa: la del modo actual (3024x1964 en la integrada; en
+    /// puntos sería la mitad), y una región a la misma escala, ajustada a píxeles enteros. H.264
+    /// 4:2:0 pide medidas pares.
+    private func medidas(id: CGDirectDisplayID, puntos: (Int, Int)) -> (ancho: Int, alto: Int, fuente: CGRect?) {
+        switch peticion.destino {
+        case .pantalla:
+            let modo = CGDisplayCopyDisplayMode(id)
+            return ((modo?.pixelWidth ?? puntos.0) & ~1, (modo?.pixelHeight ?? puntos.1) & ~1, nil)
+        case .region(let r):
+            let k = escala(de: id)
+            let a = ajustarRegion(r, escala: k, limite: CGSize(width: puntos.0, height: puntos.1))
+            return (Int((a.width * k).rounded()), Int((a.height * k).rounded()), a)
+        }
+    }
+
     private func montar(filtro: SCContentFilter, id: CGDirectDisplayID, puntos: (Int, Int)) {
-        // Resolución nativa en píxeles: la del modo actual (3024x1964 en la integrada; en puntos
-        // sería la mitad). H.264 4:2:0 pide medidas pares.
-        let modo = CGDisplayCopyDisplayMode(id)
-        let ancho = (modo?.pixelWidth ?? puntos.0) & ~1, alto = (modo?.pixelHeight ?? puntos.1) & ~1
+        let (ancho, alto, fuente) = medidas(id: id, puntos: puntos)
+        guard ancho >= 2, alto >= 2 else { fallar("La región no llega a 2x2 píxeles"); return }
         let cfg = SCStreamConfiguration()
+        if let fuente { cfg.sourceRect = fuente }
         cfg.width = ancho
         cfg.height = alto
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: peticion.fps)
@@ -551,6 +589,12 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var inicio = Date()
     var temporizador: Timer?
     var pantalla = (indice: 0, nombre: "", id: CGDirectDisplayID(0))
+    /// Qué se graba de `pantalla` en la grabación en curso (o la siguiente).
+    var destino = Destino.pantalla
+    /// Selector de región abierto (residente, desde el menú).
+    var selector: SelectorRegion?
+    /// Marco de la región que se graba, de la cuenta atrás al final.
+    var marco: MarcoRegion?
     var fuenteSenal: DispatchSourceRead?
     var saliendo = false
     var menuActual = NSMenu()
@@ -757,29 +801,88 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     // MARK: Grabación
 
-    /// Nueva grabación desde la espera (menú, atajo, reapertura o arranque normal).
-    func empezar(indice: Int? = nil) {
+    /// Nueva grabación desde la espera (menú, atajo, reapertura, arranque normal o el selector de
+    /// región). Sin `indice`, la pantalla del puntero; sin `destino`, la pantalla entera. Con el
+    /// selector abierto (el atajo, por ejemplo), lo cierra.
+    func empezar(indice: Int? = nil, destino: Destino = .pantalla) {
+        selector?.cerrar()
+        selector = nil
         tokenEspera += 1
         pantalla = elegirPantalla(forzada: indice)
+        self.destino = destino
         lanzar()
     }
 
-    /// Segundos de la grabación (0 = hasta Detener): en la terminal, su argumento; en la residente,
-    /// la duración de los Ajustes.
-    func segundosPedidos(_ a: Ajustes) -> Double? {
-        guard let t = argsTerminal.first else { return Double(a.duracion) }
+    /// Lo que se graba, para el menú: la pantalla o «región de» la pantalla.
+    var queSeGraba: String {
+        switch destino {
+        case .pantalla: return pantalla.nombre
+        case .region: return "región de \(pantalla.nombre)"
+        }
+    }
+
+    /// Segundos de la grabación (0 = hasta Detener) y región: en la terminal, sus argumentos
+    /// (`[--region X,Y,ANCHO,ALTO] segundos`); en la residente, la duración de los Ajustes y sin
+    /// región (la elige el selector). nil si los argumentos no se entienden.
+    func argumentosPedidos(_ a: Ajustes) -> (segundos: Double, region: CGRect?)? {
+        guard !argsTerminal.isEmpty else { return (Double(a.duracion), nil) }
+        var resto = argsTerminal[...]
+        var region: CGRect?
+        if resto.first == "--region" {
+            resto = resto.dropFirst()
+            guard let v = resto.first else { return nil }
+            let n = v.split(separator: ",", omittingEmptySubsequences: false).map { Double($0.trimmingCharacters(in: .whitespaces)) }
+            guard n.count == 4, let x = n[0], let y = n[1], let w = n[2], let h = n[3],
+                  [x, y, w, h].allSatisfy(\.isFinite), w > 0, h > 0 else { return nil }
+            region = CGRect(x: x, y: y, width: w, height: h)
+            resto = resto.dropFirst()
+        }
+        guard let t = resto.first else { return nil }
         guard let n = Double(t.replacingOccurrences(of: ",", with: ".")), n >= 0, n.isFinite else { return nil }
-        return n
+        return (n, region)
+    }
+
+    /// Una región de la terminal tiene que caber en la pantalla elegida (en puntos) y dar al menos
+    /// 2x2 píxeles; si no, por qué. Con una pantalla que no existe no se mira: ese error sale después.
+    func problemaRegion(_ r: CGRect) -> String? {
+        guard pantalla.id != 0 else { return nil }
+        let b = CGDisplayBounds(pantalla.id).size
+        // Como se escribió: con punto decimal, que la coma separa los cuatro números.
+        let pedida = [r.minX, r.minY, r.width, r.height].map { $0.rounded() == $0 ? String(Int($0)) : String(Double($0)) }.joined(separator: ",")
+        if r.minX < 0 || r.minY < 0 || r.maxX > b.width || r.maxY > b.height {
+            return "La región \(pedida) se sale de la pantalla \(pantalla.indice) («\(pantalla.nombre)», \(Int(b.width))x\(Int(b.height)) puntos)"
+        }
+        let a = ajustarRegion(r, escala: escala(de: pantalla.id), limite: b)
+        if a.width * escala(de: pantalla.id) < 2 || a.height * escala(de: pantalla.id) < 2 {
+            return "La región \(pedida) no llega a 2x2 píxeles"
+        }
+        return nil
     }
 
     /// Lee los Ajustes y hace la cuenta atrás que digan; al acabar (o al momento, con 0), la captura.
+    /// Con una región enseña su marco desde ya.
     func lanzar() {
         let s = Sesion()
         sesion = s
-        guard let segundos = segundosPedidos(s.ajustes) else {
-            s.ultimaLinea = "Uso: grabar-pantalla [segundos]   (0 = hasta Detener)"
+        guard let pedido = argumentosPedidos(s.ajustes) else {
+            s.ultimaLinea = "Uso: grabar-pantalla [--region X,Y,ANCHO,ALTO] [segundos]   (0 = hasta Detener)"
             terminar(s, .fallo(s.ultimaLinea), codigo: 2)
             return
+        }
+        let segundos = pedido.segundos
+        if let r = pedido.region {
+            if let p = problemaRegion(r) {
+                s.ultimaLinea = p
+                terminar(s, .fallo(p), codigo: 2)
+                return
+            }
+            destino = .region(r)
+        }
+        if case .region(let r) = destino, let p = pantallasEnOrden().first(where: { $0.id == pantalla.id })?.pantalla {
+            marco?.cerrar()
+            let m = MarcoRegion(region: regionGlobal(ajustarRegion(r, escala: escala(de: pantalla.id), limite: p.frame.size), en: p))
+            m.mostrar()
+            marco = m
         }
         let cuenta = s.ajustes.cuentaAtras
         let cuando = cuenta > 0 ? "en \(cuenta) s" : "sin cuenta atrás"
@@ -832,7 +935,7 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyyMMdd-HHmmss"
         let ruta = carpeta.appendingPathComponent("pantalla-\(f.string(from: Date())).mp4")
-        var peticion = Peticion(fps: a.calidad.fps(pantalla: pantalla.id), bitrate: a.calidad.bitrate,
+        var peticion = Peticion(destino: destino, fps: a.calidad.fps(pantalla: pantalla.id), bitrate: a.calidad.bitrate,
                                 puntero: a.mostrarPuntero, clics: a.marcarClics && hayMacOS15(), audioSistema: a.audio.sistema)
         if a.audio.microfono, !hayMacOS15() { avisar("Aviso: el micrófono necesita macOS 15; se graba sin él.") }
         guard a.audio.microfono, hayMacOS15() else {
@@ -924,6 +1027,33 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     @objc func grabarPunteroDesdeMenu() { empezar() }
+
+    /// «Grabar una región…»: abre el selector sobre todas las pantallas. Al soltar, la grabación
+    /// normal (cuenta atrás y Ajustes) de esa región; al cancelar, de vuelta a espera.
+    @objc func grabarRegionDesdeMenu() {
+        switch estado {
+        case .espera, .hecho, .error: break
+        default: return
+        }
+        selector?.cerrar()
+        let sel = SelectorRegion()
+        sel.alElegir = { [weak self] pantallaElegida, region in
+            guard let self else { return }
+            self.selector = nil
+            let id = idDe(pantallaElegida)
+            guard let i = pantallasEnOrden().firstIndex(where: { $0.id == id }) else { self.volverAEspera(en: 0); return }
+            self.empezar(indice: i, destino: .region(region))
+        }
+        sel.alCancelar = { [weak self] in
+            guard let self else { return }
+            self.selector = nil
+            if case .espera = self.estado { return }
+            self.volverAEspera(en: 0)
+        }
+        selector = sel
+        sel.abrir()
+    }
+
     @objc func grabarPantallaDesdeMenu(_ i: NSMenuItem) { empezar(indice: i.tag) }
     @objc func salir() { NSApp.terminate(nil) }
 
@@ -959,6 +1089,8 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard s === sesion else { return }
         temporizador?.invalidate()
         s.cuenta?.invalidate()
+        marco?.cerrar()
+        marco = nil
         switch final {
         case .video(let n, let segundos):
             let ruta = s.grabador?.ruta.path ?? ""
@@ -1192,6 +1324,7 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             boton?.image = iconoGrabar()
             boton?.title = ""
             accion("Grabar", #selector(grabarPunteroDesdeMenu), atajo: true)
+            accion("Grabar una región…", #selector(grabarRegionDesdeMenu))
             let sub = NSMenu()
             for (i, p) in pantallasEnOrden().enumerated() {
                 let it = NSMenuItem(title: p.pantalla.localizedName, action: #selector(grabarPantallaDesdeMenu(_:)), keyEquivalent: "")
@@ -1210,21 +1343,21 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         case .cuenta(let n):
             boton?.image = nil
             boton?.title = String(n)
-            fila("Empieza en \(n)… · \(pantalla.nombre)")
+            fila("Empieza en \(n)… · \(queSeGraba)")
             accion("Cancelar", #selector(cancelar), atajo: residente)
             fila("Clic en el icono: cancelar")
             pieResidente()
         case .iniciando:
             boton?.image = nil
             boton?.title = "Iniciando…"
-            fila("Iniciando… · \(pantalla.nombre)")
+            fila("Iniciando… · \(queSeGraba)")
             accion("Cancelar", #selector(cancelar), atajo: residente)
             fila("Clic en el icono: cancelar")
             pieResidente()
         case .grabando:
             boton?.image = iconoGrabar(rojo: true)
             boton?.title = tiempo()
-            fila("Grabando \(tiempo()) · \(pantalla.nombre)")
+            fila("Grabando \(tiempo()) · \(queSeGraba)")
             if let m = sesion?.avisoCarpeta { fila(m) }
             accion("Detener grabación", #selector(detener), residente ? "" : ".", atajo: residente)
             fila("Clic en el icono: detener")
@@ -1239,14 +1372,20 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             boton?.title = ""
             accion("Mostrar en Finder", #selector(mostrarEnFinder))
             fotogramas("Sacar fotogramas")
-            if residente { accion("Grabar", #selector(grabarPunteroDesdeMenu), atajo: true) }
+            if residente {
+                accion("Grabar", #selector(grabarPunteroDesdeMenu), atajo: true)
+                accion("Grabar una región…", #selector(grabarRegionDesdeMenu))
+            }
             pieResidente()
         case .error:
             boton?.image = simbolo("exclamationmark.triangle")
             boton?.title = ""
             fila(sesion?.ultimaLinea ?? "")
             accion("Cerrar", #selector(cerrar))
-            if residente { accion("Grabar", #selector(grabarPunteroDesdeMenu), atajo: true) }
+            if residente {
+                accion("Grabar", #selector(grabarPunteroDesdeMenu), atajo: true)
+                accion("Grabar una región…", #selector(grabarRegionDesdeMenu))
+            }
             pieResidente()
         }
         menuActual = menu

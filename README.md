@@ -7,7 +7,8 @@ desde Spotlight o desde la terminal.
   AVAssetWriter, todo dentro de la app, con audio AAC opcional (sistema y micrófono). Medido en un
   MacBook Pro con una animación a 120 Hz y la calidad «Animaciones»: de 86 a 101 fps en la
   pantalla integrada (con ffmpeg y avfoundation eran 70-76) y los 75 de una externa a 75 Hz.
-- Graba la pantalla donde está el puntero al arrancar.
+- Graba la pantalla donde está el puntero al arrancar, o una región elegida con un selector sobre
+  la pantalla (o con `--region` en la terminal).
 - App residente en la barra de menús, con un icono propio (una circunferencia con algo dentro):
   en espera un punto, cuenta atrás, punto rojo con el tiempo, «Guardando…», ✓ al acabar (y de
   vuelta a espera) y ⚠ si la captura no arranca.
@@ -57,6 +58,7 @@ la terminal (macOS se los atribuye a ella), no los suyos.
 |---|---|---|
 | Spotlight, Finder, `open` | «Grabar pantalla» | Graba la pantalla del puntero tras la cuenta atrás, hasta Detener (tope de 30 min) o los segundos de los Ajustes. |
 | Terminal | `grabar-pantalla [segundos]` | 15 s por defecto; `0` = hasta Detener |
+| Terminal, una región | `grabar-pantalla --region X,Y,ANCHO,ALTO [segundos]` | Igual |
 
 La cuenta atrás (3 s por defecto) y todo lo demás sale de los [Ajustes](#ajustes), también en la
 terminal; la duración de la terminal es siempre su argumento.
@@ -65,9 +67,17 @@ La app de Spotlight es residente: tras cada grabación vuelve a espera y se qued
 menús hasta «Salir» (⌘Q). Si ya está abierta, abrirla otra vez detiene la grabación en curso o,
 en espera, empieza una. Arrancada como ítem de inicio de sesión queda en espera sin grabar.
 
-En espera, el menú tiene «Grabar» (pantalla del puntero), «Grabar pantalla ▸» (una entrada por
-pantalla), «Ajustes…» (⌘,) y «Salir». El atajo global ⌃⌥⌘R empieza y detiene desde cualquier
-app, sin permiso de Accesibilidad.
+En espera, el menú tiene «Grabar» (pantalla del puntero), «Grabar una región…», «Grabar pantalla ▸»
+(una entrada por pantalla), «Ajustes…» (⌘,) y «Salir». El atajo global ⌃⌥⌘R empieza y detiene
+desde cualquier app, sin permiso de Accesibilidad; siempre graba la pantalla entera del puntero.
+
+«Grabar una región…» abre un selector como el de ⌘⇧5 en todas las pantallas: las oscurece, pone
+el cursor en cruz y, al arrastrar, dibuja el rectángulo con sus medidas en píxeles al lado. El
+rectángulo no sale de la pantalla donde empezó el arrastre. Soltar el ratón confirma; Esc, el clic
+derecho o un rectángulo de menos de 32x32 píxeles cancelan y vuelven a espera. Tras confirmar, la
+grabación es la de siempre (cuenta atrás, duración, calidad, puntero, clics y audio de los
+Ajustes), solo de esa zona, y un marco rojo fino la señala mientras tanto. El marco no sale en el
+vídeo ni recibe clics.
 
 Al terminar, una notificación con el número de fotogramas y los fps ofrece «Mostrar» (Finder; es
 también lo que hace pulsarla) y «Copiar ruta», y la ruta del vídeo ya queda en el portapapeles. Los
@@ -85,6 +95,14 @@ mp4 cerrado.
 Para forzar una pantalla: `GRABAR_PANTALLA_INDICE=1 grabar-pantalla 10`. 0 es la principal de
 Ajustes > Pantallas y el resto siguen el orden del sistema (`CGGetActiveDisplayList`, el mismo que
 numeraba `ffmpeg -f avfoundation -list_devices true -i ""`).
+
+`--region X,Y,ANCHO,ALTO` graba solo ese rectángulo de la pantalla elegida (la del puntero o la de
+`GRABAR_PANTALLA_INDICE`), en puntos y desde su esquina superior izquierda, con punto decimal si
+hace falta: `GRABAR_PANTALLA_INDICE=0 grabar-pantalla --region 100,100,400,300 5`. El vídeo sale a
+la resolución nativa, así que en la pantalla Retina mide el doble en píxeles (800x600) y en una
+externa a 1x lo mismo; ancho y alto se redondean a par hacia abajo (H.264 lo pide). Una región que
+se sale de la pantalla, o mal escrita, es un error con código 2, como cualquier argumento que no
+se entiende.
 
 ## Ajustes
 
@@ -164,8 +182,11 @@ tramo exigen `--forzar`. `--ancho <px>` escala; sin él, el muestreo y la hoja s
   un solo uso para la terminal. Las dos leen los Ajustes al empezar cada grabación.
   - Captura: `SCStream` de ScreenCaptureKit sobre la pantalla elegida, a su resolución nativa en
     píxeles, con el `minimumFrameInterval` de la calidad, puntero y, en macOS 15 o posterior, clics
-    marcados (los dos según los Ajustes). El filtro de contenido deja fuera las ventanas de la
-    propia app (también las de la otra instancia, residente o de terminal). Solo se escriben los
+    marcados (los dos según los Ajustes). Qué se graba es un `Destino`: la pantalla entera o una
+    región, que es la misma captura con `sourceRect` (en puntos) y `width`/`height` en píxeles a
+    la escala de esa pantalla, ajustados a píxeles enteros y pares. El filtro de contenido deja
+    fuera las ventanas de la propia app (también las de la otra instancia, residente o de
+    terminal, y el marco de la región). Solo se escriben los
     fotogramas completos: ScreenCaptureKit entrega cuando cambia algo, así que el vídeo sale con
     fps variable y las marcas de tiempo de la captura, sin remuestrear.
   - Audio: `capturesAudio` (sin el audio de la propia app) y, en macOS 15, `captureMicrophone`, en
@@ -180,9 +201,13 @@ tramo exigen `--forzar`. `--ancho <px>` escala; sin él, el muestreo y la hoja s
     inicio de sesión: `/usr/bin/log show --last 10m --predicate 'subsystem == "net.fodaveg.grabar-pantalla"'`.
 - `app/ajustes.swift`: las claves de los Ajustes, su lectura con límites y la ventana (AppKit, sin
   storyboard).
+- `app/region.swift`: el selector de región (una ventana sin borde por pantalla, por encima de la
+  barra de menús, que toma el teclado mientras está abierto y al cerrarse devuelve el foco a la
+  app de antes), el marco de la región y el paso de coordenadas de AppKit (origen abajo a la
+  izquierda de la pantalla principal) a puntos de la pantalla desde arriba a la izquierda.
 - `app/icono.swift`: dibuja el icono de la app (círculo rojo con una pantalla).
-- `app/instalar.sh`: compila `main.swift` y `ajustes.swift`, monta el bundle, genera el icono y
-  firma. Guarda en el Info.plist la ruta del repo, que la app usa para encontrar `fotogramas`.
+- `app/instalar.sh`: compila `main.swift`, `ajustes.swift` y `region.swift`, monta el bundle,
+  genera el icono y firma. Guarda en el Info.plist la ruta del repo, que la app usa para encontrar `fotogramas`.
 
 Tocar `app/` exige reinstalar; los scripts, no.
 

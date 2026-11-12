@@ -3,11 +3,15 @@
 # Lanzador de la terminal: la grabación la hace la app «Grabar pantalla» (ScreenCaptureKit y
 # AVAssetWriter, H.264 por hardware), así que este script solo se reemplaza (exec) por ella con
 # los mismos argumentos y el mismo entorno. Sin la app instalada no graba: dice cómo instalarla.
-# Uso: grabar-pantalla [segundos]   (por defecto 15; 0 = sin límite hasta Detener, con tope de seguridad de 30 min)
+# Uso: grabar-pantalla [--region X,Y,ANCHO,ALTO] [segundos]   (por defecto 15; 0 = sin límite hasta Detener, con tope de seguridad de 30 min)
 # Qué pantalla: la que indique GRABAR_PANTALLA_INDICE (0 = la principal de Ajustes > Pantallas, no
 # necesariamente la integrada; el orden es el de CGGetActiveDisplayList, el mismo que numeraba
 # ffmpeg con «Capture screen N»). Sin la variable, la de donde está el puntero al arrancar.
 # Forzarla a mano: GRABAR_PANTALLA_INDICE=1 grabar-pantalla 10
+# --region graba solo ese rectángulo de la pantalla elegida, en puntos y desde su esquina superior
+# izquierda (p. ej. --region 100,80,800,600). El vídeo sale a la resolución nativa: en una pantalla
+# Retina, el doble de píxeles (1600x1200), con ancho y alto redondeados a par. Una región que se
+# sale de la pantalla es un error con código 2, como un argumento que no se entiende.
 # Deja el vídeo en ~/Movies/pantalla-AAAAMMDD-HHMMSS.mp4 o en la carpeta de los Ajustes de la app.
 # La primera vez macOS pide permiso de «Grabación de pantalla» (si la app quedó con firma ad hoc,
 # lo vuelve a pedir tras cada reinstalación).
@@ -24,4 +28,10 @@ if [[ ! -x $app ]]; then
   print -u2 -r -- "grabar-pantalla: falta la app «Grabar pantalla» (~/Applications/Grabar pantalla.app). Instálala con ${0:A:h}/app/instalar.sh"
   exit 1
 fi
-exec "$app" "${1:-15}"
+# Los segundos por defecto también tras --region: la app los espera siempre.
+if (( $# == 0 )); then
+  set -- 15
+elif [[ $1 == --region && $# == 2 ]]; then
+  set -- "$@" 15
+fi
+exec "$app" "$@"
