@@ -12,12 +12,16 @@ desde Spotlight o desde la terminal.
   tape (desde el menú o con `--ventana`).
 - App residente en la barra de menús, con un icono propio (una circunferencia con algo dentro):
   en espera un punto, cuenta atrás, punto rojo con el tiempo, «Guardando…», ✓ al acabar (y de
-  vuelta a espera) y ⚠ si la captura no arranca.
+  vuelta a espera) y ⚠ si la captura no arranca. Con la memoria encendida, circunferencia a trazos
+  y punto rojo pequeño.
+- [Memoria de los últimos N segundos](#memoria-de-los-últimos-n-segundos-experimento)
+  (experimento): encendida desde el menú, graba en segundo plano y ⌃⌥⌘S guarda los últimos 30 s
+  (de 5 a 120), para capturar un fallo intermitente después de verlo.
 - Clic izquierdo en el icono: detiene si graba (cancela en la cuenta atrás) y abre el menú en
   espera. Clic derecho o Control + clic: abren el menú siempre.
 - Atajo global ⌃⌥⌘R para empezar y detener.
-- [Ajustes](#ajustes) (⌘,): carpeta, calidad, cuenta atrás, duración, puntero, audio, qué hacer al
-  terminar y abrir al iniciar sesión.
+- [Ajustes](#ajustes) (⌘,): carpeta, calidad, cuenta atrás, duración, segundos de la memoria,
+  puntero, audio, qué hacer al terminar y abrir al iniciar sesión.
 - Deja el vídeo en `~/Movies/pantalla-AAAAMMDD-HHMMSS.mp4`, o en la carpeta de los Ajustes.
 
 ## Requisitos
@@ -70,7 +74,8 @@ menús hasta «Salir» (⌘Q). Si ya está abierta, abrirla otra vez detiene la 
 en espera, empieza una. Arrancada como ítem de inicio de sesión queda en espera sin grabar.
 
 En espera, el menú tiene «Grabar» (pantalla del puntero), «Grabar una región…», «Grabar una
-ventana ▸», «Grabar pantalla ▸» (una entrada por pantalla), «Ajustes…» (⌘,) y «Salir». El atajo
+ventana ▸», «Grabar pantalla ▸» (una entrada por pantalla), «Memoria de los últimos N s» y «Guardar
+los últimos N s» ([abajo](#memoria-de-los-últimos-n-segundos-experimento)), «Ajustes…» (⌘,) y «Salir». El atajo
 global ⌃⌥⌘R empieza y detiene desde cualquier app, sin permiso de Accesibilidad; siempre graba la
 pantalla entera del puntero.
 
@@ -127,6 +132,40 @@ está la ventana. Sin ninguna que coincida, sale con 2 y la lista de las que hay
 `--region` es un error de uso, también con 2. Si la ventana se cierra antes de acabar, avisa en
 stderr, guarda lo grabado y sale con 0.
 
+## Memoria de los últimos N segundos (experimento)
+
+Para capturar un fallo intermitente después de verlo, sin haber estado grabando a propósito.
+Vive solo en la app residente; la terminal no tiene comando para esto.
+
+- «Memoria de los últimos N s» (una casilla del menú en espera, con el N de los Ajustes) la
+  enciende y la apaga. **Siempre empieza apagada** al abrir la app, por privacidad y batería, y no
+  hay ajuste para encenderla sola.
+- Encendida, graba en segundo plano la pantalla entera donde estaba el puntero al encenderla, con
+  la calidad, el puntero y los clics de los Ajustes y **sin audio**. El icono de la barra lo
+  enseña: circunferencia a trazos y punto rojo pequeño (distinto de espera y de grabando).
+- «Guardar los últimos N s» (activo solo con la memoria encendida) o el atajo global ⌃⌥⌘S guardan
+  esos segundos en la carpeta de los Ajustes como `pantalla-AAAAMMDD-HHMMSS-ultimos-Ns.mp4`, y
+  después pasa lo mismo que al terminar una grabación (✓, notificación «Últimos N s guardados»,
+  copiar la ruta, mostrar en Finder, según los Ajustes). La memoria sigue encendida. Si lleva menos
+  de N s encendida, guarda lo que hay, lo dice en la notificación y el nombre lleva los segundos
+  reales (`-ultimos-8s`). Si macOS no deja registrar ⌃⌥⌘S, el menú lo dice y queda el menú (que
+otro proceso ya tenga la combinación no hace fallar el registro: medido en macOS 27).
+- Una grabación normal (menú, atajo, Spotlight, región o ventana) con la memoria encendida la pone
+  en pausa: su captura para antes de que arranque la de la grabación, y vuelve al acabar esa
+  grabación. Lo guardado después salta del antes al después de la grabación, sin hueco negro.
+- El N de los Ajustes vale la próxima vez que se encienda.
+- Apagarla o salir de la app (⌘Q, «Salir», SIGTERM) borra lo grabado. Una app muerta de golpe
+  deja sus segmentos, y se borran la próxima vez que se enciende la memoria.
+
+Coste, medido en el MacBook Pro (pantalla integrada 3024x1964 a 120 Hz, calidad Normal, 60 s
+encendida): la app gasta de media un **5,9 % de un núcleo** con una animación en una esquina
+(3,5 s de CPU en 60 s) y un **0,8 %** con el escritorio quieto (0,5 s). La codificación H.264 va en
+el codificador por hardware y la captura en los procesos del sistema (WindowServer), que no
+cuentan en esa cifra. En disco, los segmentos de N = 30 s ocupan **13,4 MB** con la animación
+(16 segmentos) y **5,6 MB** quieto, en `~/Library/Caches/net.fodaveg.grabar-pantalla/memoria/`.
+Con toda la pantalla en movimiento serán del orden del peso de Normal de la tabla de los
+Ajustes: unos 30-40 MB por 30 s (calculado, no medido).
+
 ## Ajustes
 
 «Ajustes…» (⌘,) en el menú de la app residente abre una ventana de una sola página. Se abre en
@@ -140,12 +179,13 @@ preferencias de la app y vale desde la siguiente grabación, también la de la t
 | Calidad | Normal | Compacta: 30 fps, 2 Mb/s. Normal: 60 fps, 12 Mb/s. Animaciones: todos los fps de la pantalla (120 en la integrada, 75 en una externa a 75 Hz), 40 Mb/s. |
 | Cuenta atrás | 3 s | De 0 a 10 s. Con 0 empieza al momento. |
 | Duración | Hasta Detener | O N segundos, de 1 a 1800. Vale para el menú, el icono y el atajo; la terminal sigue con su argumento. El tope de 30 min no se ajusta. |
+| Memoria | 30 s | De 5 a 120 s: lo que guarda «Guardar los últimos N s» (⌃⌥⌘S). La memoria se enciende en el menú, nunca sola. |
 | Puntero | Mostrar, marcar clics | Cada uno por separado. Marcar los clics necesita macOS 15. |
 | Audio | Ninguno | Sonido del sistema (todo el Mac salvo esta app), micrófono (el de por defecto; macOS 15), o los dos. |
 | Al terminar | Notificación, sonido y copiar la ruta | Además, mostrar el vídeo en Finder. Sin notificación, el sonido es el de alerta del sistema. |
 | Abrir al iniciar sesión | No | Con `SMAppService`; la ventana enseña lo que diga macOS, también «pendiente de tu aprobación», con un botón a Ajustes del Sistema. |
 
-El atajo ⌃⌥⌘R aparece en la ventana como información; no se cambia.
+Los atajos ⌃⌥⌘R y ⌃⌥⌘S aparecen en la ventana como información; no se cambian.
 
 Las tres calidades son H.264 y las mismas marcas de tiempo variables de la captura. HEVC pesaría
 menos, pero Compacta es para adjuntar y un mp4 en HEVC no se ve en todos los navegadores. Peso
@@ -173,7 +213,8 @@ antes se descarta.
 Las claves se pueden cambiar a mano, p. ej. `defaults write net.fodaveg.grabar-pantalla calidad
 animaciones`: `carpeta`, `calidad` (`compacta`, `normal`, `animaciones`), `cuentaAtras`,
 `duracion` (0 = hasta Detener), `mostrarPuntero`, `marcarClics`, `audio` (`ninguno`, `sistema`,
-`microfono`, `sistemaYMicrofono`), `notificar`, `sonido`, `abrirEnFinder` y `copiarRuta`. Un valor
+`microfono`, `sistemaYMicrofono`), `notificar`, `sonido`, `abrirEnFinder`, `copiarRuta` y `memoria`
+(segundos). Un valor
 fuera de rango se ajusta al límite. `defaults delete net.fodaveg.grabar-pantalla` vuelve a todo lo
 de por defecto.
 
@@ -247,11 +288,52 @@ de N veces la original, porque el mp4 no guarda cuánto dura el último fotogram
   pantalla donde está cada una (la que tiene más superficie de ella) y el relleno del submenú,
   que hace la app al abrirse (`menuNeedsUpdate`), esperando la respuesta de ScreenCaptureKit
   (unas decenas de ms) para enseñarlo ya relleno.
+- `app/memoria.swift`: la memoria de los últimos N segundos. Un `SCStream` propio de la pantalla
+  entera (la misma configuración que una grabación, sin audio) y un `AVAssetWriter` nuevo cada
+  unos 2 s, cortando en un fotograma: ese fotograma es el primero del escritor nuevo, y por eso
+  fotograma clave, y el último del segmento anterior dura justo hasta él, así que entre segmentos
+  no hay hueco. El escritor siguiente se prepara a mitad de segmento para que el corte no espere
+  al codificador. Se conservan los segmentos justos para cubrir N s, en una carpeta por proceso
+  dentro de `~/Library/Caches/net.fodaveg.grabar-pantalla/memoria/`. Al guardar se cierra el
+  segmento en curso en ese instante (el mismo fotograma abre el siguiente, y la memoria sigue), se
+  unen los segmentos con `AVMutableComposition` recortando por delante a N s y se exporta con
+  `AVAssetExportSession` en passthrough, sin reencodar. La pausa para el stream y la grabación
+  normal espera a que haya parado: nunca hay dos `SCStream` de la app a la vez.
 - `app/icono.swift`: dibuja el icono de la app (círculo rojo con una pantalla).
-- `app/instalar.sh`: compila `main.swift`, `ajustes.swift`, `region.swift` y `ventana.swift`, monta el bundle,
+- `app/instalar.sh`: compila `main.swift`, `ajustes.swift`, `region.swift`, `ventana.swift` y `memoria.swift`, monta el bundle,
   genera el icono y firma. Guarda en el Info.plist la ruta del repo, que la app usa para encontrar `fotogramas`.
 
 Tocar `app/` exige reinstalar; los scripts, no.
+
+## Para desarrolladores: probar la memoria sin la residente
+
+La memoria vive en la app residente. Para probarla desde la terminal, sin abrirla, hay un punto de
+entrada de prueba (no es para usarlo a diario): la variable `GRABAR_PANTALLA_PRUEBA_MEMORIA`, al
+lanzar el binario de la app directamente.
+
+```sh
+app=~/"Applications/Grabar pantalla.app/Contents/MacOS/grabar-pantalla"
+GRABAR_PANTALLA_INDICE=0 GRABAR_PANTALLA_PRUEBA_MEMORIA=40,30 "$app"           # 40 s encendida, N = 30
+GRABAR_PANTALLA_PRUEBA_MEMORIA=40,30,10+5 "$app"                              # y a los 10 s, una grabación normal de 5 s
+GRABAR_PANTALLA_PRUEBA_MEMORIA=14,10,5+3 "$app" -cuentaAtras 0                # igual, sin cuenta atrás
+```
+
+Con `SEGUNDOS,N` enciende la memoria con ese N (de 5 a 120), espera esos segundos, guarda por el
+mismo camino que ⌃⌥⌘S (notificación y portapapeles incluidos, según los Ajustes), imprime
+`Hecho: <ruta>`, los segmentos antes y después de apagarla y los instantes de las uniones entre
+segmentos en el vídeo, vuelve a encenderla 3 s y sale por el camino de ⌘Q (la carpeta de segmentos,
+con el pid, se mira desde fuera cuando el proceso ha terminado). Con `,DESDE+DURANTE` hace además
+una grabación normal (`Hecho: <ruta>` también) a los DESDE s, que pone la memoria en pausa. No lee
+argumentos de grabación; sí `-clave valor` de los Ajustes para ese proceso, como `-cuentaAtras 0`.
+`GRABAR_PANTALLA_INDICE` elige la pantalla como en la terminal. Sale con 0 si guardó un vídeo, con
+1 si no y con 2 si la variable está mal escrita.
+
+Medido así (MacBook Pro, integrada a 120 Hz, Normal, una animación de prueba en una esquina):
+`40,30` da un vídeo de 30,000 s, sin errores de `ffmpeg -v error -i x -f null -`, con 15 uniones;
+el intervalo entre fotogramas alrededor de cada unión no pasa de 33,3 ms, el mismo máximo que
+fuera de ellas (60 fps pedidos en una pantalla de 120 Hz dan 16,7 ms casi siempre, y 8,3, 25 o
+33,3 ms a ratos), y `fotogramas --tramo` alrededor de dos uniones da 18,2 y 17,3 ms de media. `8,30`
+guarda 8,06 s y lo dice.
 
 ## Licencia
 

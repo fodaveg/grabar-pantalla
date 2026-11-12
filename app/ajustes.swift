@@ -25,6 +25,8 @@ enum Clave {
     static let sonido = "sonido"
     static let abrirEnFinder = "abrirEnFinder"
     static let copiarRuta = "copiarRuta"
+    /// Segundos que guarda la memoria de los últimos segundos, de 5 a 120 (por defecto, 30).
+    static let memoria = "memoria"
 }
 
 /// Qué audio se graba. Cada fuente va en su propia pista AAC del mp4.
@@ -55,6 +57,8 @@ struct Ajustes {
     static let cuentaMaxima = 10
     /// Lo más largo que se puede pedir: el tope de seguridad, que no se ajusta.
     static let duracionMaxima = Int(topeSegundos)
+    static let memoriaMinima = 5
+    static let memoriaMaxima = 120
 
     var carpeta = carpetaPorDefecto
     var calidad = Calidad.normal
@@ -67,6 +71,8 @@ struct Ajustes {
     var sonido = true
     var abrirEnFinder = false
     var copiarRuta = true
+    /// N de «Guardar los últimos N s». La memoria se enciende desde el menú, nunca sola.
+    var memoria = 30
 
     /// Lee los ajustes. Un valor fuera de rango (escrito a mano con `defaults`) se ajusta al límite y
     /// uno ilegible vale lo de por defecto.
@@ -86,6 +92,7 @@ struct Ajustes {
         a.sonido = si(Clave.sonido, a.sonido)
         a.abrirEnFinder = si(Clave.abrirEnFinder, a.abrirEnFinder)
         a.copiarRuta = si(Clave.copiarRuta, a.copiarRuta)
+        if d.object(forKey: Clave.memoria) != nil { a.memoria = min(max(d.integer(forKey: Clave.memoria), memoriaMinima), memoriaMaxima) }
         return a
     }
 
@@ -130,6 +137,8 @@ final class VentanaAjustes: NSWindowController, NSWindowDelegate {
     private let campoDuracion = NSTextField()
     private let pasoDuracion = NSStepper()
     private let notaTope = NSTextField(wrappingLabelWithString: "")
+    private let campoMemoria = NSTextField()
+    private let pasoMemoria = NSStepper()
     private let checkPuntero = NSButton(checkboxWithTitle: "Mostrar el puntero", target: nil, action: nil)
     private let checkClics = NSButton(checkboxWithTitle: "Marcar los clics", target: nil, action: nil)
     private let menuAudio = NSPopUpButton()
@@ -321,6 +330,15 @@ final class VentanaAjustes: NSWindowController, NSWindowDelegate {
             nota("Al grabar desde el menú, el icono o ⌃⌥⌘R. La terminal sigue con su argumento (grabar-pantalla [segundos], 15 s si no se da)."),
         ])
         filas.append([etiqueta("Duración:"), duracion])
+
+        // Memoria de los últimos segundos.
+        campoNumerico(campoMemoria, pasoMemoria, ancho: 40, maximo: Ajustes.memoriaMaxima, minimo: Ajustes.memoriaMinima,
+                      etiquetaAccesible: "Segundos que guarda la memoria", accion: #selector(cambiarMemoria(_:)))
+        let memoria = pila([
+            pila([NSTextField(labelWithString: "Guardar los últimos"), campoMemoria, pasoMemoria, NSTextField(labelWithString: "s")], vertical: false, espacio: 4),
+            nota("De \(Ajustes.memoriaMinima) a \(Ajustes.memoriaMaxima) s. La memoria se enciende en el menú y siempre empieza apagada; mientras está encendida graba en segundo plano la pantalla del puntero, con la calidad y el puntero de aquí y sin audio, y ⌃⌥⌘S guarda esos segundos. Un cambio vale la próxima vez que se encienda."),
+        ])
+        filas.append([etiqueta("Memoria:"), memoria])
         separador()
 
         // Puntero y clics.
@@ -370,7 +388,7 @@ final class VentanaAjustes: NSWindowController, NSWindowDelegate {
         filas.append([etiqueta("Inicio de sesión:"), login])
 
         // Atajo (informativo).
-        let atajo = NSTextField(wrappingLabelWithString: "⌃⌥⌘R empieza y detiene la grabación desde cualquier app.")
+        let atajo = NSTextField(wrappingLabelWithString: "⌃⌥⌘R empieza y detiene la grabación desde cualquier app. ⌃⌥⌘S guarda los últimos segundos, con la memoria encendida.")
         atajo.preferredMaxLayoutWidth = anchoControles
         atajo.isSelectable = true
         filas.append([etiqueta("Atajo:"), atajo])
@@ -426,6 +444,8 @@ final class VentanaAjustes: NSWindowController, NSWindowDelegate {
         let n = a.duracion == 0 ? 15 : a.duracion
         campoDuracion.integerValue = n
         pasoDuracion.integerValue = n
+        campoMemoria.integerValue = a.memoria
+        pasoMemoria.integerValue = a.memoria
         checkPuntero.state = a.mostrarPuntero ? .on : .off
         checkClics.state = a.marcarClics && hayMacOS15() ? .on : .off
         menuAudio.selectItem(at: Audio.allCases.firstIndex(of: a.audio) ?? 0)
@@ -441,7 +461,7 @@ final class VentanaAjustes: NSWindowController, NSWindowDelegate {
     private func habilitar() {
         let libre = !bloqueada
         aviso.isHidden = libre
-        for c: NSControl in [radioHastaDetener, radioDurante, campoCuenta, pasoCuenta, checkPuntero, menuAudio,
+        for c: NSControl in [radioHastaDetener, radioDurante, campoCuenta, pasoCuenta, campoMemoria, pasoMemoria, checkPuntero, menuAudio,
                              checkNotificar, checkSonido, checkFinder, checkCopiar, checkLogin, botonAprobar,
                              botonElegir, botonPorDefecto] {
             c.isEnabled = libre
@@ -554,6 +574,12 @@ final class VentanaAjustes: NSWindowController, NSWindowDelegate {
         notaTope.isHidden = !recortado || v != Ajustes.duracionMaxima
         if recortado { NSSound.beep() }
         d.set(v, forKey: Clave.duracion)
+    }
+
+    @objc private func cambiarMemoria(_ s: Any) {
+        let (v, recortado) = numero(s, campo: campoMemoria, paso: pasoMemoria)
+        if recortado { NSSound.beep() }
+        d.set(v, forKey: Clave.memoria)
     }
 
     @objc private func cambiarCasilla(_ b: NSButton) {

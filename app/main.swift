@@ -19,6 +19,9 @@
 // ofrecen, en ventana.swift.
 //
 // Los Ajustes (UserDefaults y ventana) están en ajustes.swift; se leen al empezar cada grabación.
+// La memoria de los últimos N segundos (experimento: grabar en segundo plano y guardar bajo
+// demanda), en memoria.swift; vive solo en la residente, y en la prueba de
+// GRABAR_PANTALLA_PRUEBA_MEMORIA.
 import AppKit
 import AVFoundation
 import Carbon.HIToolbox
@@ -46,7 +49,9 @@ let argsTerminal: [String] = {
     }
     return r
 }()
-let residente = argsTerminal.isEmpty
+/// La prueba de la memoria (GRABAR_PANTALLA_PRUEBA_MEMORIA) no es residente: no registra atajos,
+/// sale al acabar e ignora los argumentos.
+let residente = argsTerminal.isEmpty && pruebaMemoria == nil
 
 /// Calidad de la captura y del vídeo, la que se elige en Ajustes. H.264 en las tres: HEVC pesa menos
 /// a igual calidad, pero un vídeo para adjuntar tiene que abrirse en cualquier navegador y sistema.
@@ -252,11 +257,7 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
                     fallar("No encuentro esa pantalla (¿se ha desconectado?)")
                     return
                 }
-                // La propia app fuera del vídeo: su icono de la barra de menús, el menú abierto y
-                // cualquier ventana suya. Por identificador y no por pid: la residente y la de la
-                // terminal conviven y ninguna de las dos debe salir.
-                let yo = Bundle.main.bundleIdentifier
-                let propia = contenido.applications.filter { $0.processID == getpid() || (yo != nil && $0.bundleIdentifier == yo) }
+                let propia = Grabador.propias(de: contenido)
                 // Pantalla y región: la pantalla entera sin la app (también el marco de la región,
                 // que es una ventana suya); la región la recorta `sourceRect` en `montar`.
                 // Ventana: solo ella, con lo que tenga encima o no esté en pantalla (desktop
@@ -297,9 +298,17 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    private func montar(filtro: SCContentFilter, id: CGDirectDisplayID, puntos: (Int, Int), ventana: CGSize = .zero) {
-        let (ancho, alto, fuente) = medidas(id: id, puntos: puntos, ventana: ventana)
-        guard ancho >= 2, alto >= 2 else { fallar("La región no llega a 2x2 píxeles"); return }
+    /// La propia app, para dejarla fuera del vídeo: su icono de la barra de menús, el menú abierto y
+    /// cualquier ventana suya. Por identificador y no por pid: la residente y la de la terminal
+    /// conviven y ninguna de las dos debe salir.
+    static func propias(de contenido: SCShareableContent) -> [SCRunningApplication] {
+        let yo = Bundle.main.bundleIdentifier
+        return contenido.applications.filter { $0.processID == getpid() || (yo != nil && $0.bundleIdentifier == yo) }
+    }
+
+    /// Configuración del `SCStream` de `peticion` a `ancho`x`alto` píxeles (y `fuente`, el rectángulo
+    /// de una región). La comparte la memoria de los últimos segundos (memoria.swift), que pide sin audio.
+    static func configuracion(_ peticion: Peticion, ancho: Int, alto: Int, fuente: CGRect?) -> SCStreamConfiguration {
         let cfg = SCStreamConfiguration()
         if let fuente { cfg.sourceRect = fuente }
         cfg.width = ancho
@@ -336,33 +345,47 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
             cfg.captureMicrophone = true
             cfg.microphoneCaptureDeviceID = AVCaptureDevice.default(for: .audio)?.uniqueID
         }
+        return cfg
+    }
+
+    /// Entrada H.264 por hardware de `ancho`x`alto` al bitrate y fps de `peticion`. También la de los
+    /// segmentos de la memoria.
+    static func entradaVideo(_ peticion: Peticion, ancho: Int, alto: Int) -> AVAssetWriterInput {
+        let entrada = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: ancho,
+            AVVideoHeightKey: alto,
+            AVVideoEncoderSpecificationKey: [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: true],
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: peticion.bitrate,
+                AVVideoExpectedSourceFrameRateKey: peticion.fps,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                // Sin fotogramas B: con fps variable las marcas de tiempo salen tal cual.
+                AVVideoAllowFrameReorderingKey: false,
+                // Un fotograma clave por segundo, para que `fotogramas` y los reproductores salten rápido.
+                AVVideoMaxKeyFrameIntervalDurationKey: 1,
+            ],
+            AVVideoColorPropertiesKey: [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+            ],
+        ])
+        entrada.expectsMediaDataInRealTime = true
+        // Escala fina (1/90000 s) para no redondear las marcas de tiempo de la captura.
+        entrada.mediaTimeScale = 90_000
+        return entrada
+    }
+
+    private func montar(filtro: SCContentFilter, id: CGDirectDisplayID, puntos: (Int, Int), ventana: CGSize = .zero) {
+        let (ancho, alto, fuente) = medidas(id: id, puntos: puntos, ventana: ventana)
+        guard ancho >= 2, alto >= 2 else { fallar("La región no llega a 2x2 píxeles"); return }
+        let cfg = Grabador.configuracion(peticion, ancho: ancho, alto: alto, fuente: fuente)
         do {
             // AVAssetWriter no sobrescribe: si existe (dos grabaciones en el mismo segundo), fuera.
             try? FileManager.default.removeItem(at: ruta)
             let escritor = try AVAssetWriter(outputURL: ruta, fileType: .mp4)
-            let entrada = AVAssetWriterInput(mediaType: .video, outputSettings: [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: ancho,
-                AVVideoHeightKey: alto,
-                AVVideoEncoderSpecificationKey: [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: true],
-                AVVideoCompressionPropertiesKey: [
-                    AVVideoAverageBitRateKey: peticion.bitrate,
-                    AVVideoExpectedSourceFrameRateKey: peticion.fps,
-                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-                    // Sin fotogramas B: con fps variable las marcas de tiempo salen tal cual.
-                    AVVideoAllowFrameReorderingKey: false,
-                    // Un fotograma clave por segundo, para que `fotogramas` y los reproductores salten rápido.
-                    AVVideoMaxKeyFrameIntervalDurationKey: 1,
-                ],
-                AVVideoColorPropertiesKey: [
-                    AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-                    AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                    AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
-                ],
-            ])
-            entrada.expectsMediaDataInRealTime = true
-            // Escala fina (1/90000 s) para no redondear las marcas de tiempo de la captura.
-            entrada.mediaTimeScale = 90_000
+            let entrada = Grabador.entradaVideo(peticion, ancho: ancho, alto: alto)
             guard escritor.canAdd(entrada) else { fallar("El escritor de vídeo no acepta H.264 a \(ancho)x\(alto)"); return }
             escritor.add(entrada)
             // Una pista por fuente y no una mezcla: mezclar exige alinear y remuestrear dos relojes
@@ -601,12 +624,16 @@ final class Sesion {
     var ultimaLinea = ""
     var codigo: Int32 = 0
     var cancelado = false
+    /// Título de la notificación al acabar bien.
+    var tituloAviso = "Grabación terminada"
     /// Cierre de la app (Salir, SIGTERM) a la espera de que el mp4 quede cerrado.
     var alCerrar: (() -> Void)?
 }
 
 /// Atajo global fijo: ⌃⌥⌘R (los ⌘⇧3/4/5 son del sistema).
 let atajoTecla = UInt32(kVK_ANSI_R)
+/// Atajo global para guardar los últimos N s, con la memoria encendida: ⌃⌥⌘S.
+let atajoMemoriaTecla = UInt32(kVK_ANSI_S)
 let atajoModificadores = UInt32(controlKey | optionKey | cmdKey)
 let categoriaNotificacion = "grabacion-terminada"
 
@@ -638,6 +665,22 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var ventanaAjustes: VentanaAjustes?
     /// «Ajustes…» del menú principal (⌘, con la ventana delante), para deshabilitarlo grabando.
     var ajustesPrincipal: NSMenuItem?
+    /// Memoria de los últimos N s (memoria.swift): nil si está apagada. Siempre empieza apagada.
+    var memoria: Memoria?
+    /// Una grabación normal la tiene parada; vuelve al acabar esa grabación.
+    var memoriaEnPausa = false
+    /// La pausa está pedida y ScreenCaptureKit aún no ha parado su stream.
+    var parandoMemoria = false
+    /// Captura de una grabación normal que espera a que pare la memoria (nunca dos `SCStream`).
+    var arranquePendiente: (() -> Void)?
+    var guardandoMemoria = false
+    /// Por qué la memoria se apagó sola o no se pudo encender, para el menú hasta el próximo intento.
+    var avisoMemoria: String?
+    var atajoMemoriaRef: EventHotKeyRef?
+    /// ⌃⌥⌘S no se pudo registrar (otra app lo tiene): el menú lo dice.
+    var errorAtajoMemoria: String?
+    /// Segundos de la grabación normal de la prueba de la memoria (sin argumentos de terminal).
+    var duracionPedida: Double?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -653,12 +696,19 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             if Int32(b) == SIGINT { interrumpir(); return }
             guard !saliendo else { return }
             saliendo = true
-            cerrarCaptura { exit(143) }
+            cerrarCaptura { [self] in
+                memoria?.apagar()
+                exit(143)
+            }
         }
         fuente.resume()
         fuenteSenal = fuente
         configurarNotificaciones()
         if residente { registrarAtajo() }
+        if let p = pruebaMemoria {
+            probarMemoria(p)
+            return
+        }
         guard residente else {
             lanzar()
             return
@@ -701,6 +751,12 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard hayCaptura() else { return .terminateNow }
         cerrarCaptura { NSApp.reply(toApplicationShouldTerminate: true) }
         return .terminateLater
+    }
+
+    /// Al salir (⌘Q, «Salir»), los segmentos de la memoria se borran.
+    func applicationWillTerminate(_ notification: Notification) {
+        memoria?.apagar()
+        memoria = nil
     }
 
     func hayCaptura() -> Bool {
@@ -752,16 +808,29 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
     // MARK: Atajo global
 
     /// Carbon `RegisterEventHotKey`: no pide permiso de Accesibilidad. Si otra app ya tiene la
-    /// combinación, el registro falla y el atajo no funciona (se avisa por stderr).
+    /// combinación, el registro falla y el atajo no funciona (se avisa por stderr; el de la memoria,
+    /// también en el menú). Medido en macOS 27 con ⌃⌥⌘S: otro proceso que ya lo tiene no hace
+    /// fallar el registro (devuelve 0), así que el aviso queda para los demás errores. Cada atajo
+    /// lleva su id: 1, ⌃⌥⌘R; 2, ⌃⌥⌘S.
     func registrarAtajo() {
         var tipo = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            DispatchQueue.main.async { controlador.alternar() }
+        InstallEventHandler(GetApplicationEventTarget(), { _, evento, _ in
+            var id = EventHotKeyID()
+            GetEventParameter(evento, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil,
+                              MemoryLayout<EventHotKeyID>.size, nil, &id)
+            let cual = id.id
+            DispatchQueue.main.async { if cual == 2 { controlador.guardarMemoria() } else { controlador.alternar() } }
             return noErr
         }, 1, &tipo, nil, nil)
         let r = RegisterEventHotKey(atajoTecla, atajoModificadores, EventHotKeyID(signature: OSType(0x4752_4142), id: 1),
                                     GetApplicationEventTarget(), 0, &atajoRef)
         if r != noErr { avisar("No pude registrar el atajo ⌃⌥⌘R (error \(r))") }
+        let m = RegisterEventHotKey(atajoMemoriaTecla, atajoModificadores, EventHotKeyID(signature: OSType(0x4752_4142), id: 2),
+                                    GetApplicationEventTarget(), 0, &atajoMemoriaRef)
+        if m != noErr {
+            errorAtajoMemoria = "⌃⌥⌘S no funciona (error \(m) al registrarlo). Usa este menú."
+            avisar("No pude registrar el atajo ⌃⌥⌘S (error \(m))")
+        }
     }
 
     /// Atajo y reapertura: empieza si está en espera, detiene si graba, cancela en la cuenta atrás.
@@ -786,9 +855,9 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         centro.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    func notificar(ruta: String, medida: String, sonido: Bool) {
+    func notificar(ruta: String, medida: String, sonido: Bool, titulo: String = "Grabación terminada") {
         let c = UNMutableNotificationContent()
-        c.title = "Grabación terminada"
+        c.title = titulo
         c.subtitle = (ruta as NSString).lastPathComponent
         c.body = medida
         c.sound = sonido ? .default : nil
@@ -858,7 +927,8 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// argumentos no se entienden. Con `--region` y `--ventana` a la vez devuelve los dos: el error
     /// lo da `lanzar`, con su propio mensaje.
     func argumentosPedidos(_ a: Ajustes) -> (segundos: Double, region: CGRect?, ventana: String?)? {
-        guard !argsTerminal.isEmpty else { return (Double(a.duracion), nil, nil) }
+        // La prueba de la memoria no lee argumentos (sí los `-clave valor` de UserDefaults, p. ej. `-cuentaAtras 0`).
+        guard !argsTerminal.isEmpty, pruebaMemoria == nil else { return (duracionPedida ?? Double(a.duracion), nil, nil) }
         var resto = argsTerminal[...]
         var region: CGRect?
         var ventana: String?
@@ -924,6 +994,7 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func lanzar() {
         let s = Sesion()
         sesion = s
+        pausarMemoria()
         guard let pedido = argumentosPedidos(s.ajustes) else {
             terminar(s, .fallo(Controlador.uso), codigo: 2)
             return
@@ -991,23 +1062,8 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         estado = .iniciando
         pintar()
         let a = s.ajustes
-        var carpeta = a.carpeta
-        if !a.carpetaEsLaDePorDefecto, let p = problemaCarpeta(carpeta) {
-            let m = "La carpeta \(abreviar(carpeta.path)) \(p): se guarda en ~/Movies."
-            s.avisoCarpeta = m
-            avisar("Aviso: \(m)")
-            notificarAviso("Carpeta de destino no disponible", m)
-            carpeta = Ajustes.carpetaPorDefecto
-            pintar()
-        }
-        // Solo se crea ~/Movies; una carpeta elegida que falte no se crea (sería otro disco sin montar).
-        if carpeta.standardizedFileURL.path == Ajustes.carpetaPorDefecto.standardizedFileURL.path {
-            try? FileManager.default.createDirectory(at: carpeta, withIntermediateDirectories: true)
-        }
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "yyyyMMdd-HHmmss"
-        let ruta = carpeta.appendingPathComponent("pantalla-\(f.string(from: Date())).mp4")
+        let carpeta = carpetaDeDestino(s)
+        let ruta = carpeta.appendingPathComponent("pantalla-\(sello()).mp4")
         var peticion = Peticion(destino: destino, fps: a.calidad.fps(pantalla: pantalla.id), bitrate: a.calidad.bitrate,
                                 puntero: a.mostrarPuntero, clics: a.marcarClics && hayMacOS15(), audioSistema: a.audio.sistema)
         if a.audio.microfono, !hayMacOS15() { avisar("Aviso: el micrófono necesita macOS 15; se graba sin él.") }
@@ -1038,6 +1094,34 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
+    /// La carpeta de los Ajustes de `s` o, si no vale, ~/Movies con aviso (stderr, notificación y
+    /// `s.avisoCarpeta`). Solo se crea ~/Movies; una carpeta elegida que falte no se crea (sería
+    /// otro disco sin montar).
+    func carpetaDeDestino(_ s: Sesion) -> URL {
+        let a = s.ajustes
+        var carpeta = a.carpeta
+        if !a.carpetaEsLaDePorDefecto, let p = problemaCarpeta(carpeta) {
+            let m = "La carpeta \(abreviar(carpeta.path)) \(p): se guarda en ~/Movies."
+            s.avisoCarpeta = m
+            avisar("Aviso: \(m)")
+            notificarAviso("Carpeta de destino no disponible", m)
+            carpeta = Ajustes.carpetaPorDefecto
+            pintar()
+        }
+        if carpeta.standardizedFileURL.path == Ajustes.carpetaPorDefecto.standardizedFileURL.path {
+            try? FileManager.default.createDirectory(at: carpeta, withIntermediateDirectories: true)
+        }
+        return carpeta
+    }
+
+    /// AAAAMMDD-HHMMSS de ahora, para el nombre del vídeo.
+    func sello() -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyyMMdd-HHmmss"
+        return f.string(from: Date())
+    }
+
     func arrancar(_ s: Sesion, ruta: URL, segundos: Double, peticion: Peticion) {
         let g = Grabador(ruta: ruta, limite: segundos, peticion: peticion)
         s.grabador = g
@@ -1057,7 +1141,9 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             terminar(s, .fallo("No hay pantalla \(pantalla.indice) (GRABAR_PANTALLA_INDICE)"))
             return
         }
-        g.arrancar(pantalla: pantalla.id)
+        let id = pantalla.id
+        // Con la memoria aún parando su stream, la captura espera a que pare.
+        if parandoMemoria { arranquePendiente = { g.arrancar(pantalla: id) } } else { g.arrancar(pantalla: id) }
     }
 
     func formato(_ x: Double, decimales: Int = 1) -> String {
@@ -1174,6 +1260,7 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// La grabación acabó (mp4 cerrado, o nada): hecho, error o cancelación.
     func terminar(_ s: Sesion, _ final: Grabador.Final, codigo: Int32 = 1) {
         guard s === sesion else { return }
+        reanudarMemoria()
         temporizador?.invalidate()
         s.cuenta?.invalidate()
         marco?.cerrar()
@@ -1197,18 +1284,20 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
         // Cierre de la app: no hay ✓ ni ⚠ que enseñar.
         if let alCerrar = s.alCerrar { alCerrar(); return }
+        // La prueba de la memoria vuelve a espera como la residente: sale ella al acabar la prueba.
+        let vuelve = residente || pruebaMemoria != nil
         switch final {
         case .cancelado:
-            if residente { volverAEspera(en: 0) } else { salirDeTerminal(con: 130) }
+            if vuelve { volverAEspera(en: 0) } else { salirDeTerminal(con: 130) }
         case .video:
             estado = .hecho
             pintar()
             alTerminar(s)
-            if residente { volverAEspera(en: 5) } else { DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [self] in salirDeTerminal(con: 0) } }
+            if vuelve { volverAEspera(en: 5) } else { DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [self] in salirDeTerminal(con: 0) } }
         case .fallo:
             estado = .error
             pintar()
-            if residente { volverAEspera(en: 15) } else { DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [self] in salirDeTerminal(con: s.codigo) } }
+            if vuelve { volverAEspera(en: 15) } else { DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [self] in salirDeTerminal(con: s.codigo) } }
         }
     }
 
@@ -1219,7 +1308,7 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let ruta = s.rutaVideo ?? ""
         let medida = s.avisoCarpeta == nil ? s.medida : "\(s.medida). Guardado en ~/Movies: la carpeta elegida no estaba disponible."
         if a.notificar {
-            notificar(ruta: ruta, medida: medida, sonido: a.sonido)
+            notificar(ruta: ruta, medida: medida, sonido: a.sonido, titulo: s.tituloAviso)
         } else if a.sonido {
             // El sonido de alerta del sistema, el que haya elegido el usuario.
             NSSound.beep()
@@ -1229,6 +1318,186 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             NSPasteboard.general.setString(ruta, forType: .string)
         }
         if a.abrirEnFinder { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: ruta)]) }
+    }
+
+    // MARK: Memoria de los últimos segundos
+
+    /// La casilla «Memoria de los últimos N s» del menú: enciende o apaga.
+    @objc func alternarMemoria() {
+        if memoria != nil { apagarMemoria() } else { encenderMemoria() }
+    }
+
+    /// Enciende la memoria en la pantalla del puntero de ahora, con calidad, puntero y clics de los
+    /// Ajustes, sin audio y con N de los Ajustes (o `segundos`, en la prueba). `luego`, cuando la
+    /// captura ya corre. Si no arranca, se apaga y el menú dice por qué.
+    func encenderMemoria(segundos: Int? = nil, luego: @escaping () -> Void = {}) {
+        guard memoria == nil else { return }
+        switch estado {
+        case .espera, .hecho, .error: break
+        default: NSSound.beep(); return
+        }
+        Memoria.borrarRestos()
+        let a = Ajustes.leer()
+        let p = elegirPantalla()
+        let peticion = Peticion(destino: .pantalla, fps: a.calidad.fps(pantalla: p.id), bitrate: a.calidad.bitrate,
+                                puntero: a.mostrarPuntero, clics: a.marcarClics && hayMacOS15())
+        let m = Memoria(segundos: segundos ?? a.memoria, peticion: peticion, pantalla: p.id)
+        m.alFallar = { [weak self, weak m] motivo in
+            guard let self, let m, self.memoria === m else { return }
+            self.apagarMemoria(aviso: "La memoria se ha apagado: \(motivo)")
+        }
+        memoria = m
+        avisoMemoria = nil
+        pintar()
+        decir("Memoria: encendiendo en \(p.nombre), \(a.calidad.nombre), últimos \(m.segundos) s")
+        m.arrancar { [weak self, weak m] error in
+            guard let self, let m, self.memoria === m else { return }
+            if let error { self.apagarMemoria(aviso: "No se pudo encender la memoria: \(error)"); return }
+            decir("Memoria: encendida")
+            luego()
+        }
+    }
+
+    /// Apaga la memoria y borra sus segmentos. Con `aviso` (se apagó sola), el menú lo enseña; en
+    /// la prueba, sale con 1.
+    func apagarMemoria(aviso: String? = nil) {
+        memoria?.apagar()
+        memoria = nil
+        memoriaEnPausa = false
+        avisoMemoria = aviso
+        if let a = arranquePendiente { arranquePendiente = nil; parandoMemoria = false; a() }
+        if let aviso {
+            avisar(aviso)
+            if pruebaMemoria != nil { exit(1) }
+        }
+        pintar()
+    }
+
+    /// Antes de una grabación normal: para el stream de la memoria (la captura de la grabación
+    /// espera en `arrancar` hasta que pare).
+    func pausarMemoria() {
+        guard let m = memoria, !memoriaEnPausa else { return }
+        memoriaEnPausa = true
+        parandoMemoria = true
+        m.pausar { [weak self] in
+            guard let self else { return }
+            self.parandoMemoria = false
+            decir("Memoria: en pausa")
+            if let a = self.arranquePendiente { self.arranquePendiente = nil; a() }
+        }
+    }
+
+    /// Al acabar la grabación normal (bien, mal o cancelada): la memoria vuelve.
+    func reanudarMemoria() {
+        guard memoriaEnPausa, let m = memoria else { return }
+        memoriaEnPausa = false
+        m.arrancar { [weak self, weak m] error in
+            guard let self, let m, self.memoria === m else { return }
+            if let error { self.apagarMemoria(aviso: "La memoria no pudo volver tras la grabación: \(error)"); return }
+            decir("Memoria: de vuelta")
+        }
+        pintar()
+    }
+
+    @objc func guardarMemoriaDesdeMenu() { guardarMemoria() }
+
+    /// «Guardar los últimos N s» y ⌃⌥⌘S: solo con la memoria encendida y sin grabación en curso.
+    /// Al acabar, lo mismo que una grabación normal (✓, notificación, copiar la ruta… según los
+    /// Ajustes). Si había menos de N s, guarda lo que hay y lo dice. `luego` recibe si hubo vídeo.
+    func guardarMemoria(luego: @escaping (Bool) -> Void = { _ in }) {
+        guard let m = memoria, !memoriaEnPausa, !guardandoMemoria else { NSSound.beep(); luego(false); return }
+        switch estado {
+        case .espera, .hecho, .error: break
+        default: NSSound.beep(); luego(false); return
+        }
+        let s = Sesion()
+        let carpeta = carpetaDeDestino(s)
+        guardandoMemoria = true
+        pintar()
+        m.guardar(en: carpeta, sello: sello()) { [weak self] resultado in
+            guard let self else { return }
+            self.guardandoMemoria = false
+            switch resultado {
+            case .fallo(let motivo):
+                avisar(motivo)
+                self.notificarAviso("No se pudo guardar la memoria", motivo)
+                self.pintar()
+                luego(false)
+            case .video(let ruta, let segundos, let n, let uniones):
+                if pruebaMemoria != nil {
+                    // Por las cuentas de la memoria; en el mp4, cada unión es el fotograma clave a ±1
+                    // fotograma de aquí (el primero de cada segmento).
+                    decir("Uniones entre segmentos (s del vídeo, ±1 fotograma): " + uniones.map { String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), $0) }.joined(separator: " "))
+                }
+                let corta = segundos < Double(m.segundos) - 0.5
+                let pedidos = corta ? "solo había \(self.formato(segundos)) s en memoria, de \(m.segundos)" : "\(self.formato(segundos)) s"
+                s.rutaVideo = ruta.path
+                s.medida = "\(pedidos), \(n) fotogramas"
+                s.tituloAviso = corta ? "Memoria guardada (\(self.formato(segundos, decimales: 0)) s)" : "Últimos \(m.segundos) s guardados"
+                self.ultimoVideo = ruta.path
+                if corta { decir("Memoria: solo había \(self.formato(segundos)) s de los \(m.segundos) pedidos; se guarda eso") }
+                decir("Fotogramas: \(n) (en \(self.formato(segundos)) s)")
+                decir("Hecho: \(ruta.path)")
+                // Si mientras tanto empezó una grabación, solo el aviso: el ✓ pisaría su estado.
+                switch self.estado {
+                case .espera, .hecho, .error:
+                    self.tokenEspera += 1
+                    self.sesion = s
+                    self.estado = .hecho
+                    self.pintar()
+                    self.alTerminar(s)
+                    self.volverAEspera(en: 5)
+                default:
+                    self.alTerminar(s)
+                }
+                luego(true)
+            }
+        }
+    }
+
+    /// GRABAR_PANTALLA_PRUEBA_MEMORIA (README, para desarrolladores): enciende la memoria, guarda a
+    /// los segundos pedidos, enseña los segmentos antes y después de apagarla y sale (por
+    /// `NSApp.terminate`, el camino de ⌘Q). Con DESDE+DURANTE graba antes en normal, con la memoria
+    /// en pausa. Imprime lo mismo que la terminal, con «Hecho: ruta».
+    func probarMemoria(_ p: PruebaMemoria) {
+        estado = .espera
+        pintar()
+        encenderMemoria(segundos: p.segundos) { [self] in
+            if let g = p.grabar {
+                DispatchQueue.main.asyncAfter(deadline: .now() + g.desde) { [self] in
+                    decir("Prueba: grabación normal de \(formato(g.durante)) s con la memoria encendida")
+                    duracionPedida = g.durante
+                    empezar()
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + p.encendida) { [self] in
+                // Si la grabación de la prueba sigue, se espera a que acabe.
+                func cuandoEnEspera(_ hacer: @escaping () -> Void) {
+                    switch estado {
+                    case .espera, .hecho, .error: hacer()
+                    default: DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { cuandoEnEspera(hacer) }
+                    }
+                }
+                cuandoEnEspera { [self] in
+                    guard let m = memoria else { exit(1) }
+                    decir("Segmentos antes de guardar: \(m.inventario())")
+                    guardarMemoria { [self] ok in
+                        guard ok else { exit(1) }
+                        decir("Segmentos antes de apagar: \(m.inventario())")
+                        apagarMemoria()
+                        decir("Segmentos después de apagar: \(m.inventario())")
+                        // Y salir con la memoria encendida: se vuelve a encender 3 s y se sale por
+                        // el camino de ⌘Q; la carpeta se mira desde fuera cuando el proceso ya no está.
+                        encenderMemoria(segundos: p.segundos) { [self] in
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [self] in
+                                decir("Segmentos antes de salir: \(memoria?.inventario() ?? "sin memoria")")
+                                NSApp.terminate(nil)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // MARK: Ajustes
@@ -1348,15 +1617,23 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// lienzo, un punto relleno o un ✓ (record.circle, a tamaño de barra en una pantalla 1x,
     /// descentra el punto; checkmark.circle trae otra circunferencia). Sin `rojo` es plantilla y
     /// macOS lo tiñe; con `rojo` el punto va en rojo y la circunferencia en labelColor, que se
-    /// resuelve al dibujar con la apariencia de la barra.
-    func iconoGrabar(rojo: Bool = false, hecho: Bool = false) -> NSImage {
-        let lado: CGFloat = 16, grosor: CGFloat = 1.5, radioPunto: CGFloat = 3.5
+    /// resuelve al dibujar con la apariencia de la barra. Con `memoria` (encendida, en espera), la
+    /// circunferencia va a trazos y el punto, más pequeño y en rojo: graba en segundo plano, pero
+    /// no es una grabación (que lleva el aro entero, el punto grande y el tiempo).
+    func iconoGrabar(rojo: Bool = false, hecho: Bool = false, memoria: Bool = false) -> NSImage {
+        let lado: CGFloat = 16, grosor: CGFloat = 1.5, radioPunto: CGFloat = memoria ? 2.5 : 3.5
+        let color = rojo || memoria
         let img = NSImage(size: NSSize(width: lado, height: lado), flipped: false) { r in
             let c = NSPoint(x: r.midX, y: r.midY)
             let radio = lado / 2 - grosor / 2 - 0.5
             let aro = NSBezierPath(ovalIn: NSRect(x: c.x - radio, y: c.y - radio, width: radio * 2, height: radio * 2))
             aro.lineWidth = grosor
-            (rojo ? NSColor.labelColor : .black).setStroke()
+            if memoria {
+                // Ocho trazos iguales: la circunferencia mide 2πr ≈ 41 pt.
+                let paso = 2 * .pi * radio / 8
+                aro.setLineDash([paso * 0.6, paso * 0.4], count: 2, phase: 0)
+            }
+            (color ? NSColor.labelColor : .black).setStroke()
             aro.stroke()
             if hecho {
                 // ✓ dentro de la caja del punto (7 x 7 pt), con el mismo trazo que la circunferencia.
@@ -1370,12 +1647,12 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 NSColor.black.setStroke()
                 v.stroke()
             } else {
-                (rojo ? NSColor.systemRed : .black).setFill()
+                (color ? NSColor.systemRed : .black).setFill()
                 NSBezierPath(ovalIn: NSRect(x: c.x - radioPunto, y: c.y - radioPunto, width: radioPunto * 2, height: radioPunto * 2)).fill()
             }
             return true
         }
-        img.isTemplate = !rojo
+        img.isTemplate = !color
         img.accessibilityDescription = "Grabar pantalla"
         return img
     }
@@ -1418,8 +1695,8 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         boton?.imagePosition = .imageLeft
         switch estado {
         case .espera:
-            boton?.image = iconoGrabar()
-            boton?.title = ""
+            boton?.image = iconoGrabar(memoria: memoria != nil && !memoriaEnPausa)
+            boton?.title = guardandoMemoria ? "Guardando…" : ""
             accion("Grabar", #selector(grabarPunteroDesdeMenu), atajo: true)
             accion("Grabar una región…", #selector(grabarRegionDesdeMenu))
             menuVentanas()
@@ -1433,6 +1710,17 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             let padre = NSMenuItem(title: "Grabar pantalla", action: nil, keyEquivalent: "")
             padre.submenu = sub
             menu.addItem(padre)
+            // Memoria: la casilla la enciende y la apaga; guardar, solo con ella encendida (sin
+            // acción, el menú lo deja deshabilitado). N, el de la memoria encendida o el de los Ajustes.
+            menu.addItem(.separator())
+            let n = memoria?.segundos ?? Ajustes.leer().memoria
+            let casilla = accion("Memoria de los últimos \(n) s", guardandoMemoria ? nil : #selector(alternarMemoria))
+            casilla.state = memoria != nil ? .on : .off
+            let guardar = accion("Guardar los últimos \(n) s", memoria != nil && !guardandoMemoria ? #selector(guardarMemoriaDesdeMenu) : nil, "s")
+            guardar.keyEquivalentModifierMask = [.control, .option, .command]
+            if guardandoMemoria { fila("Guardando la memoria…") }
+            if let e = errorAtajoMemoria { fila(e) }
+            if let a = avisoMemoria { fila(a) }
             if let v = ultimoVideo, FileManager.default.fileExists(atPath: v) {
                 menu.addItem(.separator())
                 fotogramas("Sacar fotogramas de la última grabación")
