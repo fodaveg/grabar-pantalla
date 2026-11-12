@@ -164,6 +164,7 @@ nombre (`t002345ms.png`) para poder citarlos:
 | `fotogramas video.mp4 [N]` | N fotogramas repartidos por todo el vídeo (12 por defecto) |
 | `fotogramas video.mp4 --hoja [N]` | un solo PNG, `hoja.png`, con N miniaturas y su tiempo |
 | `fotogramas video.mp4 --tramo 2.0 3.5` | TODOS los fotogramas entre esos segundos, sin saltarse ni duplicar ninguno |
+| `fotogramas video.mp4 --lento 4` | no saca PNG: un mp4 `<nombre>-lento-4x.mp4` N veces más lento (N de 2 a 20, admite decimales como 2.5), con todos los fotogramas reales y sin audio |
 
 La carpeta sale junto al vídeo (`<nombre>-fotogramas/` o `<nombre>-tramo-<desde>-<hasta>/`) o donde
 diga `--salida <dir>`. Con `--tramo` imprime también el intervalo medio y máximo entre fotogramas
@@ -171,6 +172,14 @@ en ms: un máximo muy por encima del medio delata saltos en la grabación. Más 
 tramo exigen `--forzar`. `--ancho <px>` escala; sin él, el muestreo y la hoja salen a 1600 px y
 `--tramo` a tamaño original. El tiempo sobre las miniaturas de la hoja usa ImageMagick
 (`brew install imagemagick`); sin él, la hoja sale sin texto.
+
+`--lento N` sirve para ver a cámara lenta una animación grabada. No reencoda ni remuestrea: multiplica
+por N las marcas de tiempo de cada fotograma (`ffmpeg -itsscale N ... -c:v copy`), así que la copia
+tiene exactamente los mismos fotogramas, cada uno N veces más tiempo en pantalla, sin inventar
+ninguno. **La copia no lleva audio**: a esa velocidad no se entiende. Sale junto al vídeo o en
+`--salida <dir>`, y si ya existe se sobrescribe. Al acabar imprime la ruta, la duración antes y
+después y el número de fotogramas. La duración de la copia puede quedar unos milisegundos por debajo
+de N veces la original, porque el mp4 no guarda cuánto dura el último fotograma.
 
 ## Cómo está hecho
 
