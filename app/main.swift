@@ -9,13 +9,14 @@
 //   sesión): se queda en la barra de menús en espera y graba una vez por petición, hasta Detener
 //   (tope de 30 min) o los segundos de los Ajustes. Abierta normalmente graba al instante; como
 //   ítem de inicio de sesión queda en espera. Registra el atajo global y tiene la ventana de Ajustes.
-// - Terminal (con argumentos, que pone el script `grabar-pantalla [--region X,Y,ANCHO,ALTO]
-//   [segundos]` al hacer exec): proceso propio de un solo uso. Graba, imprime el resultado y sale
-//   con 0 si hay vídeo válido. No toca la residente, pero lee los mismos Ajustes (salvo la
-//   duración, que es su argumento).
+// - Terminal (con argumentos, que pone el script `grabar-pantalla [--region X,Y,ANCHO,ALTO |
+//   --ventana TEXTO] [segundos]` al hacer exec): proceso propio de un solo uso. Graba, imprime el
+//   resultado y sale con 0 si hay vídeo válido. No toca la residente, pero lee los mismos Ajustes
+//   (salvo la duración, que es su argumento).
 //
-// Qué se graba de la pantalla (entera o una región) es un `Destino`; el selector de región y el
-// marco que la señala están en region.swift.
+// Qué se graba (la pantalla entera, una región o una ventana de otra app) es un `Destino`; el
+// selector de región y el marco que la señala están en region.swift, y la lista de ventanas que se
+// ofrecen, en ventana.swift.
 //
 // Los Ajustes (UserDefaults y ventana) están en ajustes.swift; se leen al empezar cada grabación.
 import AppKit
@@ -159,15 +160,17 @@ signal(SIGHUP, alSenal)
 // MARK: - Captura
 
 /// Qué se graba. Pantalla y región comparten filtro (la pantalla sin las ventanas de la app) y
-/// difieren en el rectángulo y el tamaño del vídeo (`Grabador.medidas`). Un destino nuevo (una
-/// ventana) es un caso más aquí, en el filtro de `Grabador.arrancar`, en `medidas` y en
-/// `Controlador.queSeGraba`.
+/// difieren en el rectángulo y el tamaño del vídeo (`Grabador.medidas`); la ventana tiene filtro
+/// propio. Un destino nuevo es un caso más aquí, en el filtro de `Grabador.arrancar`, en `medidas`
+/// y en `Controlador.queSeGraba`.
 enum Destino {
     /// La pantalla entera, a su resolución nativa.
     case pantalla
     /// Un rectángulo de la pantalla en puntos, relativo a su esquina superior izquierda (como
     /// `sourceRect` de ScreenCaptureKit y `--region` de la terminal).
     case region(CGRect)
+    /// Una ventana de otra app, aunque otra la tape, a la escala de la pantalla donde está.
+    case ventana(VentanaGrabable)
 }
 
 /// Lo que pide una grabación a la captura, sacado de los Ajustes al empezar.
@@ -256,21 +259,30 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
                 let propia = contenido.applications.filter { $0.processID == getpid() || (yo != nil && $0.bundleIdentifier == yo) }
                 // Pantalla y región: la pantalla entera sin la app (también el marco de la región,
                 // que es una ventana suya); la región la recorta `sourceRect` en `montar`.
-                let filtro: SCContentFilter
+                // Ventana: solo ella, con lo que tenga encima o no esté en pantalla (desktop
+                // independent), del tamaño que tiene ahora.
                 switch peticion.destino {
                 case .pantalla, .region:
-                    filtro = SCContentFilter(display: pantalla, excludingApplications: propia, exceptingWindows: [])
+                    montar(filtro: SCContentFilter(display: pantalla, excludingApplications: propia, exceptingWindows: []),
+                           id: id, puntos: (pantalla.width, pantalla.height))
+                case .ventana(let v):
+                    guard let w = contenido.windows.first(where: { $0.windowID == v.id }) else {
+                        fallar("La ventana «\(v.nombre)» ya no está")
+                        return
+                    }
+                    montar(filtro: SCContentFilter(desktopIndependentWindow: w), id: id,
+                           puntos: (pantalla.width, pantalla.height), ventana: w.frame.size)
                 }
-                montar(filtro: filtro, id: id, puntos: (pantalla.width, pantalla.height))
             }
         }
     }
 
     /// Tamaño del vídeo en píxeles y, en una región, el rectángulo de la pantalla que se graba (en
     /// puntos). Siempre a la resolución nativa: la del modo actual (3024x1964 en la integrada; en
-    /// puntos sería la mitad), y una región a la misma escala, ajustada a píxeles enteros. H.264
-    /// 4:2:0 pide medidas pares.
-    private func medidas(id: CGDirectDisplayID, puntos: (Int, Int)) -> (ancho: Int, alto: Int, fuente: CGRect?) {
+    /// puntos sería la mitad), y una región a la misma escala, ajustada a píxeles enteros. Una
+    /// ventana, su tamaño en puntos `ventana` al empezar por la escala de su pantalla. H.264 4:2:0
+    /// pide medidas pares.
+    private func medidas(id: CGDirectDisplayID, puntos: (Int, Int), ventana: CGSize) -> (ancho: Int, alto: Int, fuente: CGRect?) {
         switch peticion.destino {
         case .pantalla:
             let modo = CGDisplayCopyDisplayMode(id)
@@ -279,16 +291,25 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
             let k = escala(de: id)
             let a = ajustarRegion(r, escala: k, limite: CGSize(width: puntos.0, height: puntos.1))
             return (Int((a.width * k).rounded()), Int((a.height * k).rounded()), a)
+        case .ventana:
+            let p = pixelesDeVentana(ventana, escala: escala(de: id))
+            return (p.ancho, p.alto, nil)
         }
     }
 
-    private func montar(filtro: SCContentFilter, id: CGDirectDisplayID, puntos: (Int, Int)) {
-        let (ancho, alto, fuente) = medidas(id: id, puntos: puntos)
+    private func montar(filtro: SCContentFilter, id: CGDirectDisplayID, puntos: (Int, Int), ventana: CGSize = .zero) {
+        let (ancho, alto, fuente) = medidas(id: id, puntos: puntos, ventana: ventana)
         guard ancho >= 2, alto >= 2 else { fallar("La región no llega a 2x2 píxeles"); return }
         let cfg = SCStreamConfiguration()
         if let fuente { cfg.sourceRect = fuente }
         cfg.width = ancho
         cfg.height = alto
+        // Una ventana que cambia de tamaño mientras se graba se escala dentro del tamaño del
+        // principio, sin deformarla (macOS 14; en el 13 se estira a ese tamaño).
+        if case .ventana = peticion.destino {
+            cfg.scalesToFit = true
+            if #available(macOS 14.0, *) { cfg.preservesAspectRatio = true }
+        }
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: peticion.fps)
         // 8 es el máximo recomendado: el codificador retiene los búferes mientras trabaja y con
         // menos la captura se atasca a 120 fps.
@@ -547,9 +568,16 @@ final class Grabador: NSObject, SCStreamOutput, SCStreamDelegate {
         retenido = muestra
     }
 
-    /// La captura se corta sola (pantalla desconectada, permiso retirado…): se guarda lo grabado.
+    /// La captura se corta sola (pantalla desconectada, permiso retirado, la ventana que se graba
+    /// cerrada…): se guarda lo grabado. Al cerrarse la ventana, ScreenCaptureKit da unos fotogramas
+    /// en blanco y parado (que no se escriben) y, unas décimas después, este error (-3815, sin
+    /// pantalla ni ventana que capturar): medido en macOS 27 con una ventana de prueba.
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         cola.async { [self] in
+            guard !cerrado else { return }
+            if case .ventana = peticion.destino, primero != nil, (error as NSError).code == SCStreamError.Code.noCaptureSource.rawValue {
+                avisar("La ventana se ha cerrado: se guarda lo grabado hasta ahí")
+            }
             if primero != nil { finalizar(hasta: CMClockGetTime(CMClockGetHostTimeClock())) } else { fallar(describir(error)) }
         }
     }
@@ -582,7 +610,7 @@ let atajoTecla = UInt32(kVK_ANSI_R)
 let atajoModificadores = UInt32(controlKey | optionKey | cmdKey)
 let categoriaNotificacion = "grabacion-terminada"
 
-final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     var estado = Estado.espera
     var sesion: Sesion?
@@ -813,33 +841,64 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         lanzar()
     }
 
-    /// Lo que se graba, para el menú: la pantalla o «región de» la pantalla.
+    /// Lo que se graba, para el menú: la pantalla, «región de» la pantalla o la ventana.
     var queSeGraba: String {
         switch destino {
         case .pantalla: return pantalla.nombre
         case .region: return "región de \(pantalla.nombre)"
+        case .ventana(let v): return "ventana \(v.nombre)"
         }
     }
 
-    /// Segundos de la grabación (0 = hasta Detener) y región: en la terminal, sus argumentos
-    /// (`[--region X,Y,ANCHO,ALTO] segundos`); en la residente, la duración de los Ajustes y sin
-    /// región (la elige el selector). nil si los argumentos no se entienden.
-    func argumentosPedidos(_ a: Ajustes) -> (segundos: Double, region: CGRect?)? {
-        guard !argsTerminal.isEmpty else { return (Double(a.duracion), nil) }
+    static let uso = "Uso: grabar-pantalla [--region X,Y,ANCHO,ALTO | --ventana TEXTO] [segundos]   (0 = hasta Detener)"
+
+    /// Segundos de la grabación (0 = hasta Detener), región y texto de la ventana: en la terminal,
+    /// sus argumentos (`[--region X,Y,ANCHO,ALTO | --ventana TEXTO] segundos`); en la residente, la
+    /// duración de los Ajustes y nada más (región y ventana se eligen en el menú). nil si los
+    /// argumentos no se entienden. Con `--region` y `--ventana` a la vez devuelve los dos: el error
+    /// lo da `lanzar`, con su propio mensaje.
+    func argumentosPedidos(_ a: Ajustes) -> (segundos: Double, region: CGRect?, ventana: String?)? {
+        guard !argsTerminal.isEmpty else { return (Double(a.duracion), nil, nil) }
         var resto = argsTerminal[...]
         var region: CGRect?
-        if resto.first == "--region" {
+        var ventana: String?
+        while let opcion = resto.first, opcion == "--region" || opcion == "--ventana" {
             resto = resto.dropFirst()
             guard let v = resto.first else { return nil }
+            resto = resto.dropFirst()
+            if opcion == "--ventana" {
+                guard ventana == nil, !v.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+                ventana = v
+                continue
+            }
             let n = v.split(separator: ",", omittingEmptySubsequences: false).map { Double($0.trimmingCharacters(in: .whitespaces)) }
-            guard n.count == 4, let x = n[0], let y = n[1], let w = n[2], let h = n[3],
+            guard region == nil, n.count == 4, let x = n[0], let y = n[1], let w = n[2], let h = n[3],
                   [x, y, w, h].allSatisfy(\.isFinite), w > 0, h > 0 else { return nil }
             region = CGRect(x: x, y: y, width: w, height: h)
-            resto = resto.dropFirst()
         }
+        if region != nil, ventana != nil { return (0, region, ventana) }
         guard let t = resto.first else { return nil }
         guard let n = Double(t.replacingOccurrences(of: ",", with: ".")), n >= 0, n.isFinite else { return nil }
-        return (n, region)
+        return (n, region, ventana)
+    }
+
+    /// La ventana de `--ventana`: la primera cuyo «App: título» contiene el texto. Sin coincidencia
+    /// (o sin lista), por qué, con las ventanas que sí hay, una por línea.
+    func ventanaPedida(_ texto: String) -> (ventana: VentanaGrabable?, problema: String) {
+        switch leerVentanas() {
+        case .failure(let e): return (nil, e.texto)
+        case .success(let lista):
+            if let v = buscarVentana(texto, en: lista) { return (v, "") }
+            let disponibles = lista.isEmpty ? "No hay ventanas de otras apps." : "Ventanas disponibles:\n" + lista.map { "  \($0.nombre)" }.joined(separator: "\n")
+            return (nil, "Ninguna ventana contiene «\(texto)». \(disponibles)")
+        }
+    }
+
+    /// Índice (en `pantallasEnOrden`) de la pantalla donde está una ventana; la principal si no toca ninguna.
+    func indiceDePantalla(de v: VentanaGrabable) -> Int {
+        let lista = pantallasEnOrden()
+        guard let id = pantallaDe(v.marco, entre: lista.map(\.id)) else { return 0 }
+        return lista.firstIndex { $0.id == id } ?? 0
     }
 
     /// Una región de la terminal tiene que caber en la pantalla elegida (en puntos) y dar al menos
@@ -860,14 +919,28 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     /// Lee los Ajustes y hace la cuenta atrás que digan; al acabar (o al momento, con 0), la captura.
-    /// Con una región enseña su marco desde ya.
+    /// Con una región enseña su marco desde ya. Con `--ventana`, busca la ventana y graba en la
+    /// pantalla donde está.
     func lanzar() {
         let s = Sesion()
         sesion = s
         guard let pedido = argumentosPedidos(s.ajustes) else {
-            s.ultimaLinea = "Uso: grabar-pantalla [--region X,Y,ANCHO,ALTO] [segundos]   (0 = hasta Detener)"
-            terminar(s, .fallo(s.ultimaLinea), codigo: 2)
+            terminar(s, .fallo(Controlador.uso), codigo: 2)
             return
+        }
+        if pedido.region != nil, pedido.ventana != nil {
+            terminar(s, .fallo("--region y --ventana no van juntos: se graba una región o una ventana.\n\(Controlador.uso)"), codigo: 2)
+            return
+        }
+        if let texto = pedido.ventana {
+            let (v, problema) = ventanaPedida(texto)
+            guard let v else {
+                terminar(s, .fallo(problema), codigo: 2)
+                return
+            }
+            pantalla = elegirPantalla(forzada: indiceDePantalla(de: v))
+            destino = .ventana(v)
+            decir("Ventana: \(v.nombre)")
         }
         let segundos = pedido.segundos
         if let r = pedido.region {
@@ -1054,6 +1127,20 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
         sel.abrir()
     }
 
+    /// Una entrada de «Grabar una ventana»: la grabación normal de esa ventana, en la pantalla donde está.
+    @objc func grabarVentanaDesdeMenu(_ i: NSMenuItem) {
+        guard let v = i.representedObject as? VentanaGrabable else { return }
+        switch estado {
+        case .espera, .hecho, .error: empezar(indice: indiceDePantalla(de: v), destino: .ventana(v))
+        default: return
+        }
+    }
+
+    /// El submenú «Grabar una ventana» se rellena al abrirse, con las ventanas que haya en ese momento.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        rellenarMenuVentanas(menu, con: leerVentanas(), destino: self, accion: #selector(grabarVentanaDesdeMenu(_:)))
+    }
+
     @objc func grabarPantallaDesdeMenu(_ i: NSMenuItem) { empezar(indice: i.tag) }
     @objc func salir() { NSApp.terminate(nil) }
 
@@ -1101,7 +1188,8 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             decir("Fotogramas: \(n) (≈ \(formato(fps)) fps en \(formato(segundos)) s)")
             decir("Hecho: \(ruta)")
         case .fallo(let m):
-            s.ultimaLinea = m
+            // En el menú, solo la primera línea (la lista de ventanas de `--ventana` va a stderr).
+            s.ultimaLinea = m.split(separator: "\n").first.map(String.init) ?? m
             s.codigo = codigo
             avisar(m)
         case .cancelado:
@@ -1318,6 +1406,15 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             ajustesPrincipal?.isEnabled = !grabando
             ventanaAjustes?.bloquear(hayCaptura())
         }
+        /// «Grabar una ventana ▸»: vacío hasta que se abre (`menuNeedsUpdate` lo rellena con las de ese momento).
+        func menuVentanas() {
+            let sub = NSMenu()
+            sub.delegate = self
+            sub.addItem(withTitle: "Buscando ventanas…", action: nil, keyEquivalent: "").isEnabled = false
+            let padre = NSMenuItem(title: "Grabar una ventana", action: nil, keyEquivalent: "")
+            padre.submenu = sub
+            menu.addItem(padre)
+        }
         boton?.imagePosition = .imageLeft
         switch estado {
         case .espera:
@@ -1325,6 +1422,7 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             boton?.title = ""
             accion("Grabar", #selector(grabarPunteroDesdeMenu), atajo: true)
             accion("Grabar una región…", #selector(grabarRegionDesdeMenu))
+            menuVentanas()
             let sub = NSMenu()
             for (i, p) in pantallasEnOrden().enumerated() {
                 let it = NSMenuItem(title: p.pantalla.localizedName, action: #selector(grabarPantallaDesdeMenu(_:)), keyEquivalent: "")
@@ -1375,6 +1473,7 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             if residente {
                 accion("Grabar", #selector(grabarPunteroDesdeMenu), atajo: true)
                 accion("Grabar una región…", #selector(grabarRegionDesdeMenu))
+                menuVentanas()
             }
             pieResidente()
         case .error:
@@ -1385,6 +1484,7 @@ final class Controlador: NSObject, NSApplicationDelegate, UNUserNotificationCent
             if residente {
                 accion("Grabar", #selector(grabarPunteroDesdeMenu), atajo: true)
                 accion("Grabar una región…", #selector(grabarRegionDesdeMenu))
+                menuVentanas()
             }
             pieResidente()
         }

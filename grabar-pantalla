@@ -3,7 +3,7 @@
 # Lanzador de la terminal: la grabación la hace la app «Grabar pantalla» (ScreenCaptureKit y
 # AVAssetWriter, H.264 por hardware), así que este script solo se reemplaza (exec) por ella con
 # los mismos argumentos y el mismo entorno. Sin la app instalada no graba: dice cómo instalarla.
-# Uso: grabar-pantalla [--region X,Y,ANCHO,ALTO] [segundos]   (por defecto 15; 0 = sin límite hasta Detener, con tope de seguridad de 30 min)
+# Uso: grabar-pantalla [--region X,Y,ANCHO,ALTO | --ventana TEXTO] [segundos]   (por defecto 15; 0 = sin límite hasta Detener, con tope de seguridad de 30 min)
 # Qué pantalla: la que indique GRABAR_PANTALLA_INDICE (0 = la principal de Ajustes > Pantallas, no
 # necesariamente la integrada; el orden es el de CGGetActiveDisplayList, el mismo que numeraba
 # ffmpeg con «Capture screen N»). Sin la variable, la de donde está el puntero al arrancar.
@@ -12,6 +12,13 @@
 # izquierda (p. ej. --region 100,80,800,600). El vídeo sale a la resolución nativa: en una pantalla
 # Retina, el doble de píxeles (1600x1200), con ancho y alto redondeados a par. Una región que se
 # sale de la pantalla es un error con código 2, como un argumento que no se entiende.
+# --ventana graba solo una ventana de otra app, aunque otra la tape: la primera cuyo «App: título»
+# contenga TEXTO sin distinguir mayúsculas ni tildes (p. ej. --ventana finder, --ventana "safari:
+# github"), en el orden del submenú «Grabar una ventana» (por app). GRABAR_PANTALLA_INDICE no
+# cuenta: la escala es la de la pantalla donde está la ventana, y el vídeo mide lo que ella al
+# empezar, en píxeles y par. Si cambia de tamaño, se escala dentro de ese tamaño sin deformarla; si
+# se cierra, se guarda lo grabado. Sin coincidencia, error con la lista de ventanas y código 2;
+# --ventana con --region, error de uso y código 2.
 # Deja el vídeo en ~/Movies/pantalla-AAAAMMDD-HHMMSS.mp4 o en la carpeta de los Ajustes de la app.
 # La primera vez macOS pide permiso de «Grabación de pantalla» (si la app quedó con firma ad hoc,
 # lo vuelve a pedir tras cada reinstalación).
@@ -28,10 +35,10 @@ if [[ ! -x $app ]]; then
   print -u2 -r -- "grabar-pantalla: falta la app «Grabar pantalla» (~/Applications/Grabar pantalla.app). Instálala con ${0:A:h}/app/instalar.sh"
   exit 1
 fi
-# Los segundos por defecto también tras --region: la app los espera siempre.
+# Los segundos por defecto también tras --region o --ventana: la app los espera siempre.
 if (( $# == 0 )); then
   set -- 15
-elif [[ $1 == --region && $# == 2 ]]; then
+elif [[ ($1 == --region || $1 == --ventana) && $# == 2 ]]; then
   set -- "$@" 15
 fi
 exec "$app" "$@"

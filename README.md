@@ -7,8 +7,9 @@ desde Spotlight o desde la terminal.
   AVAssetWriter, todo dentro de la app, con audio AAC opcional (sistema y micrófono). Medido en un
   MacBook Pro con una animación a 120 Hz y la calidad «Animaciones»: de 86 a 101 fps en la
   pantalla integrada (con ffmpeg y avfoundation eran 70-76) y los 75 de una externa a 75 Hz.
-- Graba la pantalla donde está el puntero al arrancar, o una región elegida con un selector sobre
-  la pantalla (o con `--region` en la terminal).
+- Graba la pantalla donde está el puntero al arrancar, una región elegida con un selector sobre
+  la pantalla (o con `--region` en la terminal) o una sola ventana de otra app, aunque otra la
+  tape (desde el menú o con `--ventana`).
 - App residente en la barra de menús, con un icono propio (una circunferencia con algo dentro):
   en espera un punto, cuenta atrás, punto rojo con el tiempo, «Guardando…», ✓ al acabar (y de
   vuelta a espera) y ⚠ si la captura no arranca.
@@ -59,6 +60,7 @@ la terminal (macOS se los atribuye a ella), no los suyos.
 | Spotlight, Finder, `open` | «Grabar pantalla» | Graba la pantalla del puntero tras la cuenta atrás, hasta Detener (tope de 30 min) o los segundos de los Ajustes. |
 | Terminal | `grabar-pantalla [segundos]` | 15 s por defecto; `0` = hasta Detener |
 | Terminal, una región | `grabar-pantalla --region X,Y,ANCHO,ALTO [segundos]` | Igual |
+| Terminal, una ventana | `grabar-pantalla --ventana TEXTO [segundos]` | Igual, o hasta que se cierre la ventana |
 
 La cuenta atrás (3 s por defecto) y todo lo demás sale de los [Ajustes](#ajustes), también en la
 terminal; la duración de la terminal es siempre su argumento.
@@ -67,9 +69,10 @@ La app de Spotlight es residente: tras cada grabación vuelve a espera y se qued
 menús hasta «Salir» (⌘Q). Si ya está abierta, abrirla otra vez detiene la grabación en curso o,
 en espera, empieza una. Arrancada como ítem de inicio de sesión queda en espera sin grabar.
 
-En espera, el menú tiene «Grabar» (pantalla del puntero), «Grabar una región…», «Grabar pantalla ▸»
-(una entrada por pantalla), «Ajustes…» (⌘,) y «Salir». El atajo global ⌃⌥⌘R empieza y detiene
-desde cualquier app, sin permiso de Accesibilidad; siempre graba la pantalla entera del puntero.
+En espera, el menú tiene «Grabar» (pantalla del puntero), «Grabar una región…», «Grabar una
+ventana ▸», «Grabar pantalla ▸» (una entrada por pantalla), «Ajustes…» (⌘,) y «Salir». El atajo
+global ⌃⌥⌘R empieza y detiene desde cualquier app, sin permiso de Accesibilidad; siempre graba la
+pantalla entera del puntero.
 
 «Grabar una región…» abre un selector como el de ⌘⇧5 en todas las pantallas: las oscurece, pone
 el cursor en cruz y, al arrastrar, dibuja el rectángulo con sus medidas en píxeles al lado. El
@@ -78,6 +81,18 @@ derecho o un rectángulo de menos de 32x32 píxeles cancelan y vuelven a espera.
 grabación es la de siempre (cuenta atrás, duración, calidad, puntero, clics y audio de los
 Ajustes), solo de esa zona, y un marco rojo fino la señala mientras tanto. El marco no sale en el
 vídeo ni recibe clics.
+
+«Grabar una ventana ▸» lista, al abrirse, las ventanas que hay en ese momento en pantalla de las
+otras apps, como «App: título» (el título, recortado a 60 caracteres) y ordenadas por app. Se
+quedan fuera las de esta app, las que no tienen título, las de menos de 50x50 puntos y las que no
+son ventanas normales (barra de menús, Dock, avisos). Elegir una la graba como siempre (cuenta
+atrás, duración, calidad, puntero, clics y audio de los Ajustes), sin marco en pantalla: el vídeo
+sale solo con esa ventana, con su barra de título, aunque otra la tape o esté detrás de todo. El
+vídeo mide lo que mide la ventana al empezar,
+en píxeles de su pantalla (el doble en una Retina) y redondeado a par. Si la ventana cambia de
+tamaño mientras se graba, el tamaño del vídeo no cambia: ScreenCaptureKit la escala para que quepa
+entera sin deformarla y deja en negro lo que sobra (abajo o a la derecha; en macOS 13 la estira).
+Si la ventana se cierra, la grabación se detiene y guarda lo grabado hasta ese momento.
 
 Al terminar, una notificación con el número de fotogramas y los fps ofrece «Mostrar» (Finder; es
 también lo que hace pulsarla) y «Copiar ruta», y la ruta del vídeo ya queda en el portapapeles. Los
@@ -103,6 +118,14 @@ la resolución nativa, así que en la pantalla Retina mide el doble en píxeles 
 externa a 1x lo mismo; ancho y alto se redondean a par hacia abajo (H.264 lo pide). Una región que
 se sale de la pantalla, o mal escrita, es un error con código 2, como cualquier argumento que no
 se entiende.
+
+`--ventana TEXTO` graba la primera ventana del submenú «Grabar una ventana» (mismas reglas y mismo
+orden) cuyo «App: título» contenga ese texto, sin distinguir mayúsculas ni tildes y mirando el
+título entero: `grabar-pantalla --ventana "finder: videos" 10`. Antes de la cuenta atrás imprime
+`Ventana: App: título`. `GRABAR_PANTALLA_INDICE` no cuenta: la escala es la de la pantalla donde
+está la ventana. Sin ninguna que coincida, sale con 2 y la lista de las que hay; `--ventana` con
+`--region` es un error de uso, también con 2. Si la ventana se cierra antes de acabar, avisa en
+stderr, guarda lo grabado y sale con 0.
 
 ## Ajustes
 
@@ -191,11 +214,16 @@ de N veces la original, porque el mp4 no guarda cuánto dura el último fotogram
   un solo uso para la terminal. Las dos leen los Ajustes al empezar cada grabación.
   - Captura: `SCStream` de ScreenCaptureKit sobre la pantalla elegida, a su resolución nativa en
     píxeles, con el `minimumFrameInterval` de la calidad, puntero y, en macOS 15 o posterior, clics
-    marcados (los dos según los Ajustes). Qué se graba es un `Destino`: la pantalla entera o una
+    marcados (los dos según los Ajustes). Qué se graba es un `Destino`: la pantalla entera, una
     región, que es la misma captura con `sourceRect` (en puntos) y `width`/`height` en píxeles a
-    la escala de esa pantalla, ajustados a píxeles enteros y pares. El filtro de contenido deja
-    fuera las ventanas de la propia app (también las de la otra instancia, residente o de
-    terminal, y el marco de la región). Solo se escriben los
+    la escala de esa pantalla, ajustados a píxeles enteros y pares, o una ventana. El filtro de
+    contenido de pantalla y región deja fuera las ventanas de la propia app (también las de la
+    otra instancia, residente o de terminal, y el marco de la región). La ventana es
+    `SCContentFilter(desktopIndependentWindow:)`, que la compone sola aunque esté tapada, con
+    `width`/`height` fijos al empezar (su marco por la escala de su pantalla), `scalesToFit` y
+    `preservesAspectRatio`. Al cerrarse, ScreenCaptureKit da unos fotogramas en blanco (que no
+    se escriben) y para el stream con el error -3815 (sin nada que capturar), que guarda lo
+    grabado como cualquier corte de la captura. Solo se escriben los
     fotogramas completos: ScreenCaptureKit entrega cuando cambia algo, así que el vídeo sale con
     fps variable y las marcas de tiempo de la captura, sin remuestrear.
   - Audio: `capturesAudio` (sin el audio de la propia app) y, en macOS 15, `captureMicrophone`, en
@@ -214,8 +242,13 @@ de N veces la original, porque el mp4 no guarda cuánto dura el último fotogram
   barra de menús, que toma el teclado mientras está abierto y al cerrarse devuelve el foco a la
   app de antes), el marco de la región y el paso de coordenadas de AppKit (origen abajo a la
   izquierda de la pantalla principal) a puntos de la pantalla desde arriba a la izquierda.
+- `app/ventana.swift`: qué ventanas se ofrecen (de `SCShareableContent`, solo las que están en
+  pantalla, y el filtro de arriba), su nombre «App: título», la búsqueda de `--ventana`, la
+  pantalla donde está cada una (la que tiene más superficie de ella) y el relleno del submenú,
+  que hace la app al abrirse (`menuNeedsUpdate`), esperando la respuesta de ScreenCaptureKit
+  (unas decenas de ms) para enseñarlo ya relleno.
 - `app/icono.swift`: dibuja el icono de la app (círculo rojo con una pantalla).
-- `app/instalar.sh`: compila `main.swift`, `ajustes.swift` y `region.swift`, monta el bundle,
+- `app/instalar.sh`: compila `main.swift`, `ajustes.swift`, `region.swift` y `ventana.swift`, monta el bundle,
   genera el icono y firma. Guarda en el Info.plist la ruta del repo, que la app usa para encontrar `fotogramas`.
 
 Tocar `app/` exige reinstalar; los scripts, no.
